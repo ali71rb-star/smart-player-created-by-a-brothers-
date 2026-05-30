@@ -6,6 +6,8 @@ import "android.app.AlertDialog"
 import "android.content.DialogInterface"
 import "android.media.MediaPlayer"
 import "java.io.File"
+import "java.io.FileInputStream"
+import "java.io.FileOutputStream"
 import "android.net.Uri"
 import "android.content.Intent"
 import "android.view.WindowManager"
@@ -34,6 +36,20 @@ import "android.os.Environment"
 import "android.view.SurfaceView"
 import "android.view.SurfaceHolder"
 
+-- Helper to create byte array (works in all LuaJava environments)
+local function newByteArray(size)
+    return luajava.newArray(luajava.bindClass("java.lang.Byte").TYPE, size)
+end
+
+-- Helper to set StrictMode policy (avoids nested class syntax error)
+local function setStrictModeAllowFileUri()
+    pcall(function()
+        local builder = luajava.newInstance("android.os.StrictMode$VmPolicy$Builder")
+        local policy = builder.build()
+        StrictMode.setVmPolicy(policy)
+    end)
+end
+
 -- Truly Persistent Global Player Instance & States
 if not _G.smart_media_player then
     _G.smart_media_player = MediaPlayer()
@@ -58,6 +74,8 @@ local currentCustomSpeedSet = nil
 local showWhatsAppMediaToggle = "on"
 local showVolumeBoostToggle = "on"
 local showSleepTimerToggle = "on"
+local showStatusImages = "on"
+local showStatusVideos = "on"
 
 -- Search, Sort & Browse Engine States
 local currentSortMethod = "A-Z"
@@ -200,8 +218,10 @@ local function saveState()
             f:write((currentSavedMediaType or "audio") .. "\n")
             f:write((currentFilePath or "") .. "\n")
             local pos = 0
-            if player and currentFilePath ~= "" then pcall(function() pos = player.getCurrentPosition() end) end
-            if pos == 0 and lastPlayedPosition > 0 then pos = lastPlayedPosition end
+            if player and currentFilePath ~= "" and _G.smart_media_player_is_prepared then 
+                pcall(function() pos = player.getCurrentPosition() end) 
+            end
+            if pos <= 0 and lastPlayedPosition > 0 then pos = lastPlayedPosition end
             f:write(tostring(pos) .. "\n")
             f:write(tostring(ffRwDuration) .. "\n")
             f:write((backgroundPlay or "on") .. "\n")
@@ -213,6 +233,8 @@ local function saveState()
             f:write((currentBrowseMode or "folders") .. "\n")
             f:write((showVolumeBoostToggle or "on") .. "\n")
             f:write((showSleepTimerToggle or "on") .. "\n")
+            f:write((showStatusImages or "on") .. "\n")
+            f:write((showStatusVideos or "on") .. "\n")
             f:close()
         end
     end)
@@ -237,6 +259,8 @@ local function loadState()
             currentBrowseMode = f:read("*l") or "folders"
             showVolumeBoostToggle = f:read("*l") or "on"
             showSleepTimerToggle = f:read("*l") or "on"
+            showStatusImages = f:read("*l") or "on"
+            showStatusVideos = f:read("*l") or "on"
             f:close()
         end
     end)
@@ -273,8 +297,87 @@ local function matchesFormat(name, mediaType)
         return lower:find("%.mp3$") or lower:find("%.m4a$") or lower:find("%.wav$") or lower:find("%.ogg$") or lower:find("%.amr$") or lower:find("%.opus$")
     elseif mediaType == "video" then
         return lower:find("%.mp4$") or lower:find("%.mkv$") or lower:find("%.3gp$")
+    elseif mediaType == "statuses" then
+        local isImg = lower:find("%.jpg$") or lower:find("%.jpeg$") or lower:find("%.png$")
+        local isVid = lower:find("%.mp4$") or lower:find("%.mkv$") or lower:find("%.3gp$")
+        if isImg and showStatusImages == "off" then return false end
+        if isVid and showStatusVideos == "off" then return false end
+        return isImg or isVid
     end
     return false
+end
+
+-- WhatsApp Status Helpers (Save, Share & Open External View Engine)
+local function openImageExternally(filePath)
+    pcall(function()
+        local context = service
+        local file = File(filePath)
+        setStrictModeAllowFileUri()
+        local uri = Uri.fromFile(file)
+        
+        local intent = Intent(Intent.ACTION_VIEW)
+        intent.setDataAndType(uri, "image/*")
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        context.startActivity(intent)
+    end)
+end
+
+-- FIXED: Save to Gallery using MediaStore (Android 10+ compatible) with correct byte array
+local function saveStatusToGallery(filePath)
+    pcall(function()
+        local srcFile = File(filePath)
+        local fileName = srcFile.getName()
+        local mimeType = fileName:lower():find("%.mp4$") and "video/mp4" or "image/jpeg"
+        
+        local resolver = service.getContentResolver()
+        local contentValues = luajava.newInstance("android.content.ContentValues")
+        contentValues.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+        contentValues.put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+        contentValues.put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/Saved Statuses")
+        
+        local collection
+        if mimeType:find("video") then
+            collection = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        else
+            collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        end
+        
+        local uri = resolver.insert(collection, contentValues)
+        if uri then
+            local os = resolver.openOutputStream(uri)
+            local ins = FileInputStream(srcFile)
+            local buffer = newByteArray(8192)
+            local len
+            while true do
+                len = ins.read(buffer)
+                if len == -1 then break end
+                os.write(buffer, 0, len)
+            end
+            ins.close()
+            os.close()
+            showToast("Status saved to Download/Saved Statuses")
+        else
+            -- fallback to old method (if MediaStore fails)
+            local destDir = File("/storage/emulated/0/Download/Saved Statuses")
+            if not destDir.exists() then destDir.mkdirs() end
+            local destFile = File(destDir, fileName)
+            local inStream = FileInputStream(srcFile)
+            local outStream = FileOutputStream(destFile)
+            local buffer = newByteArray(4096)
+            local bytesRead = inStream.read(buffer)
+            while bytesRead ~= -1 do
+                outStream.write(buffer, 0, bytesRead)
+                bytesRead = inStream.read(buffer)
+            end
+            inStream.close()
+            outStream.close()
+            local intent = Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE)
+            intent.setData(Uri.fromFile(destFile))
+            service.sendBroadcast(intent)
+            showToast("Status saved to Download/Saved Statuses (legacy)")
+        end
+    end)
 end
 
 -- MediaStore helper
@@ -335,7 +438,7 @@ local function getAllRecursiveFiles(rootPath, mediaType)
             if data then
                 local fileObj = File(data)
                 local name = fileObj.getName()
-                if not name:find("^%.") and matchesFormat(name, mediaType) then
+                if (mediaType == "statuses" or not name:find("^%.")) and matchesFormat(name, mediaType) then
                     local time = 0
                     pcall(function() time = cursor.getLong(cursor.getColumnIndex(MediaStore.Files.FileColumns.DATE_MODIFIED)) * 1000 end)
                     table.insert(files, {name = name, path = data, isDir = false, time = time})
@@ -352,7 +455,7 @@ local function getAllRecursiveFiles(rootPath, mediaType)
             for i = 0, #list - 1 do
                 local f = list[i]
                 local name = f.getName()
-                if not name:find("^%.") then
+                if mediaType == "statuses" or not name:find("^%.") then
                     local isDir = false
                     pcall(function() isDir = f.isDirectory() end)
                     if isDir then
@@ -433,7 +536,7 @@ local function getExternalSdCardPath()
         for i = 0, #list - 1 do
             local f = list[i]
             local name = f.getName()
-            if not name:find("^%.") and name ~= "emulated" and name ~= "self" and name ~= "sdcard0" then
+            if not name:find("^%.") and name ~= "emulated" and name ~= "self" and name ~= "sdcard0" and name ~= "0" then
                 local isDir = false
                 pcall(function() isDir = f.isDirectory() end)
                 if isDir then
@@ -471,7 +574,7 @@ local function getExternalSdCardPath()
     return "/storage"
 end
 
-local showMainMenu, showStorageMenu, showWhatsAppMenu, showMediaTypeMenu, showBrowseModeMenu, renderMediaList, playMedia, showPlayerControls, showMoreOptions, startSeekBarUpdate, showSettingsMenu, showAudioSettingsMenu, showSleepTimerDialog, showPlaybackSpeedMenu
+local showMainMenu, showStorageMenu, showWhatsAppMenu, showMediaTypeMenu, showBrowseModeMenu, renderMediaList, playMedia, showPlayerControls, showMoreOptions, startSeekBarUpdate, showSettingsMenu, showAudioSettingsMenu, showSleepTimerDialog, showPlaybackSpeedMenu, showStatusSettingsMenu
 
 -- 1. Main Menu
 showMainMenu = function()
@@ -503,11 +606,14 @@ end
 
 -- WhatsApp Media Shortcut
 showWhatsAppMenu = function()
-    local items = {"WhatsApp Audio", "WhatsApp Voice Notes", "WhatsApp Video"}
+    local items = {"WhatsApp Audio", "WhatsApp Voice Notes", "WhatsApp Video", "WhatsApp Statuses"}
     local builder = AlertDialog.Builder(service)
     builder.setTitle("WhatsApp Media Center")
     builder.setItems(items, function(dialog, which)
         local baseDir = "/storage/emulated/0/Android/media/com.whatsapp/WhatsApp/Media/"
+        if not File(baseDir .. "WhatsApp Video").exists() then
+            baseDir = "/storage/emulated/0/WhatsApp/Media/"
+        end
         local selectedPath = ""
         local mediaType = "audio"
         if which == 0 then
@@ -517,6 +623,9 @@ showWhatsAppMenu = function()
         elseif which == 2 then
             selectedPath = baseDir .. "WhatsApp Video"
             mediaType = "video"
+        elseif which == 3 then
+            selectedPath = baseDir .. ".Statuses"
+            mediaType = "statuses"
         end
         local checkFile = File(selectedPath)
         if checkFile.exists() and checkFile.isDirectory() then
@@ -537,6 +646,7 @@ end
 showSettingsMenu = function()
     local items = {
         "Audio Settings",
+        "Status Settings",
         "Show WhatsApp Media in Main Menu: " .. showWhatsAppMediaToggle:upper()
     }
     local builder = AlertDialog.Builder(service)
@@ -545,6 +655,8 @@ showSettingsMenu = function()
         if which == 0 then
             showAudioSettingsMenu()
         elseif which == 1 then
+            showStatusSettingsMenu()
+        elseif which == 2 then
             if showWhatsAppMediaToggle == "on" then
                 showWhatsAppMediaToggle = "off"
             else
@@ -557,6 +669,29 @@ showSettingsMenu = function()
     end)
     builder.setNegativeButton("Back", function() showMainMenu() end)
     showDialogSafe(builder, function() showMainMenu() end)
+end
+
+-- Status Settings Sub-Menu
+showStatusSettingsMenu = function()
+    local items = {
+        "Show Images in Status Folder: " .. showStatusImages:upper(),
+        "Show Videos in Status Folder: " .. showStatusVideos:upper()
+    }
+    local builder = AlertDialog.Builder(service)
+    builder.setTitle("Status Settings")
+    builder.setItems(items, function(dialog, which)
+        if which == 0 then
+            showStatusImages = (showStatusImages == "on") and "off" or "on"
+            showToast("Images in Status: " .. showStatusImages:upper())
+        elseif which == 1 then
+            showStatusVideos = (showStatusVideos == "on") and "off" or "on"
+            showToast("Videos in Status: " .. showStatusVideos:upper())
+        end
+        saveState()
+        showStatusSettingsMenu()
+    end)
+    builder.setNegativeButton("Back", function() showSettingsMenu() end)
+    showDialogSafe(builder, function() showSettingsMenu() end)
 end
 
 -- Audio Settings Sub-Menu
@@ -878,7 +1013,7 @@ renderMediaList = function(currentPath, mediaType)
             for i = 0, #list - 1 do
                 local f = list[i]
                 local name = f.getName()
-                if not name:find("^%.") and name ~= "emulated" and name ~= "self" and name ~= "sdcard0" and name ~= "0" then
+                if (mediaType == "statuses" or not name:find("^%.")) and name ~= "emulated" and name ~= "self" and name ~= "sdcard0" and name ~= "0" then
                     if not (isStorageRoot and name:find("^%w+-%w+$")) then
                         local isDir = false
                         pcall(function() isDir = f.isDirectory() end)
@@ -967,7 +1102,13 @@ renderMediaList = function(currentPath, mediaType)
         if item.isDir then
             table.insert(items, "[Folder] " .. item.name)
         else
-            table.insert(items, (mediaType == "audio" and "" or "🎬 ") .. item.name)
+            local icon = ""
+            if mediaType == "video" or (mediaType == "statuses" and item.name:lower():find("%.mp4$")) then
+                icon = "🎬 "
+            elseif mediaType == "statuses" then
+                icon = "🖼️ "
+            end
+            table.insert(items, icon .. item.name)
         end
         table.insert(actions, {type = "media", data = item})
     end
@@ -1024,17 +1165,30 @@ renderMediaList = function(currentPath, mediaType)
             if selectedMedia.isDir then
                 renderMediaList(selectedMedia.path, mediaType)
             else
-                currentPlaylist = {}
-                for _, innerObj in ipairs(filteredList) do
-                    if not innerObj.isDir then
-                        table.insert(currentPlaylist, innerObj.path)
-                        if innerObj.path == selectedMedia.path then
-                            currentIndex = #currentPlaylist
+                if mediaType == "statuses" and not selectedMedia.path:lower():find("%.mp4$") then
+                    openImageExternally(selectedMedia.path)
+                else
+                    currentPlaylist = {}
+                    for _, innerObj in ipairs(filteredList) do
+                        if not innerObj.isDir then
+                            if mediaType == "statuses" then
+                                if innerObj.path:lower():find("%.mp4$") then
+                                    table.insert(currentPlaylist, innerObj.path)
+                                    if innerObj.path == selectedMedia.path then
+                                        currentIndex = #currentPlaylist
+                                    end
+                                end
+                            else
+                                table.insert(currentPlaylist, innerObj.path)
+                                if innerObj.path == selectedMedia.path then
+                                    currentIndex = #currentPlaylist
+                                end
+                            end
                         end
                     end
+                    lastPlayedPosition = 0
+                    playMedia(selectedMedia.path, true)
                 end
-                lastPlayedPosition = 0
-                playMedia(selectedMedia.path, true) -- Force Play when explicitly selected from list
             end
         end
     end)
@@ -1055,17 +1209,15 @@ renderMediaList = function(currentPath, mediaType)
     showDialogSafe(builder, backFunc)
 end
 
--- 7. Media Playback Function (State-Aware Playback Engine)
+-- 7. Media Playback Function
 playMedia = function(filePath, forcePlay)
     currentFilePath = filePath
     saveState()
     
-    -- Smart State Logic: Determine if we should start playing or keep it paused
     local shouldStart = false
     if forcePlay ~= nil then
         shouldStart = forcePlay
     else
-        -- If currently playing, next track will auto-play. If paused, next track will stay paused!
         pcall(function() shouldStart = player.isPlaying() end)
     end
 
@@ -1084,7 +1236,7 @@ playMedia = function(filePath, forcePlay)
                     if currentIndex < #currentPlaylist then
                         currentIndex = currentIndex + 1
                         lastPlayedPosition = 0
-                        playMedia(currentPlaylist[currentIndex], true) -- AutoPlay Next always forces start
+                        playMedia(currentPlaylist[currentIndex], true)
                     else
                         cancelNotification()
                         if btnPlayPauseRef then btnPlayPauseRef.setText("Play") end
@@ -1140,7 +1292,7 @@ showPlayerControls = function()
             txtTimeRef.setPadding(0, 0, 0, 15)
             layout.addView(txtTimeRef)
 
-            if currentSavedMediaType == "video" then
+            if currentSavedMediaType == "video" or currentSavedMediaType == "statuses" then
                 local surfaceView = SurfaceView(context)
                 local lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 550)
                 lp.setMargins(0, 10, 0, 15)
@@ -1253,7 +1405,7 @@ showPlayerControls = function()
                     if currentIndex > 1 then
                         currentIndex = currentIndex - 1
                         lastPlayedPosition = 0
-                        playMedia(currentPlaylist[currentIndex]) -- Inherits current playback state
+                        playMedia(currentPlaylist[currentIndex])
                     else showToast("First file.") end
                 end
             }))
@@ -1319,7 +1471,7 @@ showPlayerControls = function()
                     if currentIndex < #currentPlaylist then
                         currentIndex = currentIndex + 1
                         lastPlayedPosition = 0
-                        playMedia(currentPlaylist[currentIndex]) -- Inherits current playback state
+                        playMedia(currentPlaylist[currentIndex])
                     else showToast("Last file.") end
                 end
             }))
@@ -1353,7 +1505,10 @@ showPlayerControls = function()
                     if backgroundPlay == "on" then
                         showNotification(File(currentFilePath).getName())
                     else
-                        pcall(function() if player.isPlaying() then player.pause() end lastPlayedPosition = player.getCurrentPosition() end)
+                        pcall(function() 
+                            if player.isPlaying() then player.pause() end 
+                            lastPlayedPosition = player.getCurrentPosition() 
+                        end)
                         _G.smart_player_is_prepared = true
                         saveState() cancelNotification()
                     end
@@ -1396,7 +1551,10 @@ showPlayerControls = function()
                         if backgroundPlay == "on" then
                             showNotification(File(currentFilePath).getName())
                         else
-                            pcall(function() if player.isPlaying() then player.pause() end lastPlayedPosition = player.getCurrentPosition() end)
+                            pcall(function() 
+                                if player.isPlaying() then player.pause() end 
+                                lastPlayedPosition = player.getCurrentPosition() 
+                            end)
                             _G.smart_player_is_prepared = true
                             saveState() cancelNotification()
                         end
@@ -1412,7 +1570,7 @@ showPlayerControls = function()
     }))
 end
 
--- 9. Optimized SeekBar & Text Sync Thread (Prevents TalkBack double-click bugs)
+-- 9. Optimized SeekBar & Text Sync Thread
 local isUpdating = false
 startSeekBarUpdate = function()
     if isUpdating then return end
@@ -1435,7 +1593,6 @@ startSeekBarUpdate = function()
 
                 if ok and total > 0 then
                     if btnPlayPauseRef then
-                        -- Fixed: Replaced .toString() with tostring(...) for stable Lua bridging
                         local expectedText = isPlaying and "Pause" or "Play"
                         if tostring(btnPlayPauseRef.getText()) ~= expectedText then
                             btnPlayPauseRef.setText(expectedText)
@@ -1443,6 +1600,10 @@ startSeekBarUpdate = function()
                     end
                     seekBarRef.setMax(total)
                     seekBarRef.setProgress(current)
+                    
+                    if isPlaying then
+                        lastPlayedPosition = current
+                    end
                     
                     local curSec = math.floor(current / 1000)
                     local curMin = math.floor(curSec / 60)
@@ -1471,13 +1632,28 @@ startSeekBarUpdate = function()
     handler.post(updateRunnable)
 end
 
--- 10. More Options Menu
+-- 10. More Options Menu (Modified: Added Save to Gallery for statuses)
 showMoreOptions = function()
     local file = File(currentFilePath)
     local options = {"Delete", "Share", "Playback Speed"}
+    -- Add Save to Gallery option only if current media is a status
+    if currentSavedMediaType == "statuses" then
+        table.insert(options, 1, "Save to Gallery")  -- insert at beginning
+    end
     local builder = AlertDialog.Builder(service)
     builder.setItems(options, function(dialog, which)
-        if which == 0 then
+        -- Adjust index because we may have inserted an extra option
+        local idx = which + 1
+        if currentSavedMediaType == "statuses" then
+            if idx == 1 then
+                saveStatusToGallery(currentFilePath)
+                return
+            else
+                idx = idx - 1
+            end
+        end
+        if idx == 1 then
+            -- Delete
             if file.isDirectory() then showToast("Cannot delete folders.") return end
             local confirm = AlertDialog.Builder(service)
             confirm.setTitle("Delete File?")
@@ -1495,7 +1671,8 @@ showMoreOptions = function()
             end)
             confirm.setNegativeButton("Cancel", nil)
             showDialogSafe(confirm, function() showMoreOptions() end)
-        elseif which == 1 then
+        elseif idx == 2 then
+            -- Share
             saveState()
             local originalPackage = ""
             pcall(function()
@@ -1524,8 +1701,7 @@ showMoreOptions = function()
                     end
                 end)
                 if not shareUri then
-                    local policy = StrictMode.VmPolicy.Builder().build()
-                    StrictMode.setVmPolicy(policy)
+                    setStrictModeAllowFileUri()
                     shareUri = Uri.fromFile(file)
                 end
                 local intent = Intent(Intent.ACTION_SEND)
@@ -1541,6 +1717,7 @@ showMoreOptions = function()
             local monitorHandler = Handler(Looper.getMainLooper())
             local monitorRunnable
             local loopCount = 0
+            local hasLeftApp = false
             
             monitorRunnable = Runnable({
                 run = function()
@@ -1551,7 +1728,16 @@ showMoreOptions = function()
                         if root then currentPkg = tostring(root.getPackageName()) end
                     end)
                     local currentPkgLower = currentPkg:lower()
-                    if currentPkg == originalPackage or currentPkgLower:find("launcher") or currentPkgLower:find("home") then
+                    
+                    if currentPkg ~= "" and currentPkg ~= originalPackage and not currentPkgLower:find("launcher") and not currentPkgLower:find("home") then
+                        hasLeftApp = true
+                    end
+                    
+                    if hasLeftApp and (currentPkg == originalPackage or currentPkgLower:find("launcher") or currentPkgLower:find("home")) then
+                        Handler(Looper.getMainLooper()).post(Runnable({
+                            run = function() showPlayerControls() end
+                        }))
+                    elseif not hasLeftApp and loopCount > 10 then
                         Handler(Looper.getMainLooper()).post(Runnable({
                             run = function() showPlayerControls() end
                         }))
@@ -1561,7 +1747,7 @@ showMoreOptions = function()
                 end
             })
             monitorHandler.postDelayed(monitorRunnable, 1000)
-        elseif which == 2 then
+        elseif idx == 3 then
             showPlaybackSpeedMenu("more_options")
         end
     end)
@@ -1570,21 +1756,37 @@ showMoreOptions = function()
 end
 
 ----------------------------------------------------------------------
--- Boot Initialization Engine (Forced Fresh Preparation)
+-- Boot Initialization Engine
 ----------------------------------------------------------------------
 loadState()
 _G.smart_player_minimized = false
 
 if currentFilePath and currentFilePath ~= "" and File(currentFilePath).exists() then
-    -- Reload and extract exact file duration metadata instantly
+    local needInit = true
     pcall(function()
-        player.reset()
-        player.setDataSource(currentFilePath)
-        player.prepare()
-        _G.smart_player_is_prepared = true
-        _G.smart_player_current_path = currentFilePath
-        
-        if lastPlayedPosition > 0 then player.seekTo(lastPlayedPosition) end
+        if _G.smart_player_is_prepared and _G.smart_player_current_path == currentFilePath then
+            needInit = false
+        end
+    end)
+    
+    if needInit then
+        pcall(function()
+            player.reset()
+            player.setDataSource(currentFilePath)
+            player.prepare()
+            _G.smart_player_is_prepared = true
+            _G.smart_player_current_path = currentFilePath
+            if lastPlayedPosition > 0 then player.seekTo(lastPlayedPosition) end
+        end)
+    else
+        pcall(function()
+            if not player.isPlaying() and lastPlayedPosition > 0 then
+                player.seekTo(lastPlayedPosition)
+            end
+        end)
+    end
+
+    pcall(function()
         loudnessEnhancer = LoudnessEnhancer(player.getAudioSessionId())
         applyVolumeBoost(true)
         applyPlaybackSpeed()
@@ -1624,7 +1826,7 @@ if currentFilePath and currentFilePath ~= "" and File(currentFilePath).exists() 
                         for i = 0, #list - 1 do
                             local f = list[i]
                             local name = f.getName()
-                            if not name:find("^%.") and not f.isDirectory() and matchesFormat(name, currentSavedMediaType) then
+                            if (currentSavedMediaType == "statuses" or not name:find("^%.")) and not f.isDirectory() and matchesFormat(name, currentSavedMediaType) then
                                 local time = 0
                                 pcall(function() time = f.lastModified() end)
                                 table.insert(rawFiles, {name = name, path = f.getAbsolutePath(), time = time})
