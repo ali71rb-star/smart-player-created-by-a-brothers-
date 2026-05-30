@@ -35,6 +35,10 @@ import "android.widget.ScrollView"
 import "android.os.Environment"
 import "android.view.SurfaceView"
 import "android.view.SurfaceHolder"
+import "android.widget.ListView"
+import "android.widget.ArrayAdapter"
+import "android.widget.AdapterView"
+import "java.lang.Thread"
 
 -- Helper to create byte array (works in all LuaJava environments)
 local function newByteArray(size)
@@ -58,6 +62,11 @@ if not _G.smart_media_player then
 end
 local player = _G.smart_media_player
 
+-- Persistent custom FF/RW dynamic configurations storage
+if not _G.ffRwOptions then
+    _G.ffRwOptions = {5000, 10000, 20000, 30000, 60000}
+end
+
 local currentPlaylist = {}
 local currentIndex = 1
 local currentFilePath = ""
@@ -70,17 +79,21 @@ local autoPlay = "on"
 local currentBoostStage = 1
 local loudnessEnhancer = nil
 local currentPlaybackSpeed = 1.0
-local currentCustomSpeedSet = nil
 local showWhatsAppMediaToggle = "on"
 local showVolumeBoostToggle = "on"
 local showSleepTimerToggle = "on"
 local showStatusImages = "on"
 local showStatusVideos = "on"
+local multiSelectSetting = "on"
 
 -- Search, Sort & Browse Engine States
 local currentSortMethod = "A-Z"
 local currentSearchQuery = ""
 local currentBrowseMode = "folders" 
+
+-- Multi-Select Engine Global Variables
+local isMultiSelectActive = false
+local selectedItemsMap = {}
 
 -- Sleep Timer Engine Variables
 local sleepHandler = Handler(Looper.getMainLooper())
@@ -209,6 +222,68 @@ local function cancelNotification()
     end)
 end
 
+-- Recursive Folder Deletion Engine
+local function deleteFolderRecursive(fileOrDirectory)
+    if fileOrDirectory.isDirectory() then
+        local children = fileOrDirectory.listFiles()
+        if children then
+            for i = 0, #children - 1 do
+                deleteFolderRecursive(children[i])
+            end
+        end
+    end
+    return fileOrDirectory.delete()
+end
+
+-- Recursive Folder Size Calculation Engine
+local function getFolderSizeRecursive(fileOrDirectory)
+    local totalSize = 0
+    if fileOrDirectory.isDirectory() then
+        local children = fileOrDirectory.listFiles()
+        if children then
+            for i = 0, #children - 1 do
+                totalSize = totalSize + getFolderSizeRecursive(children[i])
+            end
+        end
+    else
+        pcall(function() totalSize = fileOrDirectory.length() end)
+    end
+    return totalSize
+end
+
+-- Helper to Format Bytes to MB/GB
+local function formatSize(totalBytes)
+    local sizeInMb = totalBytes / (1024 * 1024)
+    if sizeInMb >= 1024 then
+        local sizeInGb = sizeInMb / 1024
+        return string.format("%.2f GB", sizeInGb)
+    else
+        return string.format("%.2f MB", sizeInMb)
+    end
+end
+
+-- Multi-Select Statistics Tracker (Optimized with cached pre-fetched sizes to avoid freezes)
+local function getSelectedStats(filteredList, selectedMap)
+    local count = 0
+    local totalSize = 0
+    for _, item in ipairs(filteredList) do
+        if selectedMap[item.path] then
+            count = count + 1
+            if item.size and item.size > 0 then
+                totalSize = totalSize + item.size
+            else
+                local f = File(item.path)
+                if item.isDir then
+                    pcall(function() totalSize = totalSize + getFolderSizeRecursive(f) end)
+                else
+                    pcall(function() totalSize = totalSize + f.length() end)
+                end
+            end
+        end
+    end
+    return count, formatSize(totalSize)
+end
+
 -- Persistent Storage: Save State
 local function saveState()
     pcall(function()
@@ -235,6 +310,7 @@ local function saveState()
             f:write((showSleepTimerToggle or "on") .. "\n")
             f:write((showStatusImages or "on") .. "\n")
             f:write((showStatusVideos or "on") .. "\n")
+            f:write((multiSelectSetting or "on") .. "\n")
             f:close()
         end
     end)
@@ -261,6 +337,7 @@ local function loadState()
             showSleepTimerToggle = f:read("*l") or "on"
             showStatusImages = f:read("*l") or "on"
             showStatusVideos = f:read("*l") or "on"
+            multiSelectSetting = f:read("*l") or "on"
             f:close()
         end
     end)
@@ -323,7 +400,7 @@ local function openImageExternally(filePath)
     end)
 end
 
--- FIXED: Save to Gallery using MediaStore (Android 10+ compatible) with correct byte array
+-- SAVE to Gallery using MediaStore (Android 10+ compatible) with correct byte array
 local function saveStatusToGallery(filePath)
     pcall(function()
         local srcFile = File(filePath)
@@ -422,12 +499,12 @@ local function getMediaStoreDirsAndFiles(rootPath, mediaType)
     return dirList, files
 end
 
--- Recursive Scanner Engine
+-- Recursive Scanner Engine (Optimized with size projection to cache file sizes instantly)
 local function getAllRecursiveFiles(rootPath, mediaType)
     local files = {}
     local resolver = service.getContentResolver()
     local uri = MediaStore.Files.getContentUri("external")
-    local projection = {MediaStore.Files.FileColumns.DATA, MediaStore.Files.FileColumns.DATE_MODIFIED}
+    local projection = {MediaStore.Files.FileColumns.DATA, MediaStore.Files.FileColumns.DATE_MODIFIED, MediaStore.Files.FileColumns.SIZE}
     local selection = MediaStore.Files.FileColumns.DATA .. " LIKE ?"
     local selArgs = {rootPath .. "/%"}
     local cursor = nil
@@ -441,7 +518,9 @@ local function getAllRecursiveFiles(rootPath, mediaType)
                 if (mediaType == "statuses" or not name:find("^%.")) and matchesFormat(name, mediaType) then
                     local time = 0
                     pcall(function() time = cursor.getLong(cursor.getColumnIndex(MediaStore.Files.FileColumns.DATE_MODIFIED)) * 1000 end)
-                    table.insert(files, {name = name, path = data, isDir = false, time = time})
+                    local size = 0
+                    pcall(function() size = cursor.getLong(cursor.getColumnIndex(MediaStore.Files.FileColumns.SIZE)) end)
+                    table.insert(files, {name = name, path = data, isDir = false, time = time, size = size})
                 end
             end
         end
@@ -464,7 +543,9 @@ local function getAllRecursiveFiles(rootPath, mediaType)
                         if matchesFormat(name, mediaType) then
                             local time = 0
                             pcall(function() time = f.lastModified() end)
-                            table.insert(files, {name = name, path = f.getAbsolutePath(), isDir = false, time = time})
+                            local size = 0
+                            pcall(function() size = f.length() end)
+                            table.insert(files, {name = name, path = f.getAbsolutePath(), isDir = false, time = time, size = size})
                         end
                     end
                 end
@@ -647,7 +728,8 @@ showSettingsMenu = function()
     local items = {
         "Audio Settings",
         "Status Settings",
-        "Show WhatsApp Media in Main Menu: " .. showWhatsAppMediaToggle:upper()
+        "Show WhatsApp Media in Main Menu: " .. showWhatsAppMediaToggle:upper(),
+        "Multi-Select Mode Setting: " .. multiSelectSetting:upper()
     }
     local builder = AlertDialog.Builder(service)
     builder.setTitle("Settings")
@@ -664,6 +746,15 @@ showSettingsMenu = function()
             end
             saveState()
             showToast("WhatsApp Media Visibility: " .. showWhatsAppMediaToggle:upper())
+            showSettingsMenu()
+        elseif which == 3 then
+            if multiSelectSetting == "on" then
+                multiSelectSetting = "off"
+            else
+                multiSelectSetting = "on"
+            end
+            saveState()
+            showToast("Multi-Select Mode: " .. multiSelectSetting:upper())
             showSettingsMenu()
         end
     end)
@@ -710,51 +801,92 @@ showAudioSettingsMenu = function()
     builder.setTitle("Audio Settings")
     builder.setItems(items, function(dialog, which)
         if which == 0 then
-            local durItems = {"5 Seconds", "10 Seconds", "20 Seconds", "30 Seconds", "60 Seconds", "Custom..."}
+            local durItems = {}
+            local actionDurations = {}
+            for _, dur in ipairs(_G.ffRwOptions) do
+                table.insert(durItems, math.floor(dur / 1000) .. " Seconds")
+                table.insert(actionDurations, dur)
+            end
+            table.insert(durItems, "Add Custom Duration...")
+            
+            local lvDur = ListView(service)
+            local adapterDur = ArrayAdapter(service, android.R.layout.simple_list_item_1, durItems)
+            lvDur.setAdapter(adapterDur)
+            
             local durBuilder = AlertDialog.Builder(service)
-            durBuilder.setTitle("Select Fast Forward and Rewind Duration")
-            durBuilder.setItems(durItems, function(d, w)
-                if w == 5 then
-                    Handler(Looper.getMainLooper()).post(Runnable({
-                        run = function()
-                            local inputField = EditText(service)
-                            inputField.setHint("Enter seconds (e.g., 25)")
-                            inputField.setInputType(InputType.TYPE_CLASS_NUMBER)
-                            inputField.setText(tostring(math.floor(ffRwDuration / 1000)))
-                            
-                            local customDurBuilder = AlertDialog.Builder(service)
-                            customDurBuilder.setTitle("Enter Custom Duration")
-                            customDurBuilder.setView(inputField)
-                            customDurBuilder.setPositiveButton("Set", function()
-                                local val = tonumber(tostring(inputField.getText()))
-                                if val and val > 0 then
-                                    ffRwDuration = val * 1000
-                                    saveState()
-                                    showToast("Duration set to " .. val .. " seconds")
-                                else
-                                    showToast("Invalid duration")
-                                end
-                                showAudioSettingsMenu()
-                            end)
-                            customDurBuilder.setNegativeButton("Cancel", function()
-                                showAudioSettingsMenu()
-                            end)
-                            showDialogSafe(customDurBuilder, function() showAudioSettingsMenu() end)
-                        end
-                    }))
-                else
-                    if w == 0 then ffRwDuration = 5000
-                    elseif w == 1 then ffRwDuration = 10000
-                    elseif w == 2 then ffRwDuration = 20000
-                    elseif w == 3 then ffRwDuration = 30000
-                    elseif w == 4 then ffRwDuration = 60000 end
-                    saveState()
-                    showToast("Duration updated")
-                    showAudioSettingsMenu()
+            durBuilder.setTitle("Select FF/RW Duration (Long Press to Delete)")
+            durBuilder.setView(lvDur)
+            local durDialog = nil
+            
+            lvDur.setOnItemClickListener(AdapterView.OnItemClickListener({
+                onItemClick = function(parent, view, position, id)
+                    local idx = position + 1
+                    if idx == #durItems then
+                        durDialog.dismiss()
+                        Handler(Looper.getMainLooper()).post(Runnable({
+                            run = function()
+                                local inputField = EditText(service)
+                                inputField.setHint("Enter seconds (e.g., 25)")
+                                inputField.setInputType(InputType.TYPE_CLASS_NUMBER)
+                                
+                                local customDurBuilder = AlertDialog.Builder(service)
+                                customDurBuilder.setTitle("Enter Custom Duration")
+                                customDurBuilder.setView(inputField)
+                                customDurBuilder.setPositiveButton("Add", function()
+                                    local val = tonumber(tostring(inputField.getText()))
+                                    if val and val > 0 then
+                                        table.insert(_G.ffRwOptions, val * 1000)
+                                        ffRwDuration = val * 1000
+                                        saveState()
+                                        showToast("Duration added and selected: " .. val .. " seconds")
+                                    else
+                                        showToast("Invalid duration")
+                                    end
+                                    showAudioSettingsMenu()
+                                end)
+                                customDurBuilder.setNegativeButton("Cancel", function() showAudioSettingsMenu() end)
+                                showDialogSafe(customDurBuilder, function() showAudioSettingsMenu() end)
+                            end
+                        }))
+                    else
+                        ffRwDuration = actionDurations[idx]
+                        saveState()
+                        showToast("Duration updated to " .. math.floor(ffRwDuration / 1000) .. " seconds")
+                        durDialog.dismiss()
+                        showAudioSettingsMenu()
+                    end
                 end
-            end)
-            durBuilder.setNegativeButton("Back", function() showAudioSettingsMenu() end)
-            showDialogSafe(durBuilder, function() showAudioSettingsMenu() end)
+            }))
+            
+            lvDur.setOnItemLongClickListener(AdapterView.OnItemLongClickListener({
+                onItemLongClick = function(parent, view, position, id)
+                    local idx = position + 1
+                    if idx < #durItems then
+                        local targetDel = actionDurations[idx]
+                        durDialog.dismiss()
+                        local confDel = AlertDialog.Builder(service)
+                        confDel.setTitle("Delete Duration?")
+                        confDel.setMessage("Are you sure you want to delete " .. math.floor(targetDel / 1000) .. " seconds from list?")
+                        confDel.setPositiveButton("Delete", function()
+                            table.remove(_G.ffRwOptions, idx)
+                            showToast("Duration deleted.")
+                            showAudioSettingsMenu()
+                        end)
+                        confDel.setNegativeButton("Cancel", function() showAudioSettingsMenu() end)
+                        showDialogSafe(confDel, function() showAudioSettingsMenu() end)
+                    end
+                    return true
+                end
+            }))
+            
+            Handler(Looper.getMainLooper()).post(Runnable({
+                run = function()
+                    durDialog = durBuilder.create()
+                    durDialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+                    durDialog.show()
+                end
+            }))
+            
         elseif which == 1 then
             if backgroundPlay == "on" then backgroundPlay = "off" cancelNotification() else backgroundPlay = "on" end
             saveState()
@@ -787,66 +919,24 @@ end
 
 -- Playback Speed Menu
 showPlaybackSpeedMenu = function(parentMenu)
-    local baseSpeeds = {0.5, 1.0, 1.5, 2.0}
-    local items = {"0.5x", "1.0x (Normal)", "1.5x", "2.0x"}
-    
-    local isCustomActive = true
-    for _, v in ipairs(baseSpeeds) do
+    local availableSpeeds = {0.5, 0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 2.75, 3.0, 3.5, 3.75, 4.0}
+    local items = {}
+    for _, v in ipairs(availableSpeeds) do
         if math.abs(currentPlaybackSpeed - v) < 0.01 then
-            isCustomActive = false
-            break
+            table.insert(items, string.format("%.2fx (Active)", v))
+        else
+            table.insert(items, string.format("%.2fx", v))
         end
-    end
-    
-    if isCustomActive then
-        table.insert(items, string.format("%.2fx (Custom)", currentPlaybackSpeed))
-        table.insert(baseSpeeds, currentPlaybackSpeed)
-    end
-    
-    if parentMenu == "settings" then
-        table.insert(items, "Set Custom Speed...")
     end
     
     local speedBuilder = AlertDialog.Builder(service)
     speedBuilder.setTitle("Playback Speed")
     speedBuilder.setItems(items, function(d, w)
-        local idx = w + 1
-        if parentMenu == "settings" and idx == #items then
-            Handler(Looper.getMainLooper()).post(Runnable({
-                run = function()
-                    local inputField = EditText(service)
-                    inputField.setHint("e.g. 1.25 or 1.75")
-                    inputField.setInputType(InputType.TYPE_CLASS_NUMBER + InputType.TYPE_NUMBER_FLAG_DECIMAL)
-                    inputField.setText(tostring(currentPlaybackSpeed))
-                    
-                    local customBuilder = AlertDialog.Builder(service)
-                    customBuilder.setTitle("Enter Custom Speed")
-                    customBuilder.setView(inputField)
-                    customBuilder.setPositiveButton("Set", function()
-                        local val = tonumber(tostring(inputField.getText()))
-                        if val and val > 0 and val <= 4.0 then
-                            currentPlaybackSpeed = val
-                            applyPlaybackSpeed()
-                            saveState()
-                            showToast("Speed set to " .. val .. "x")
-                        else
-                            showToast("Invalid speed. Enter between 0.1 and 4.0")
-                        end
-                        showAudioSettingsMenu()
-                    end)
-                    customBuilder.setNegativeButton("Cancel", function()
-                        showAudioSettingsMenu()
-                    end)
-                    showDialogSafe(customBuilder, function() showAudioSettingsMenu() end)
-                end
-            }))
-        else
-            currentPlaybackSpeed = baseSpeeds[idx]
-            applyPlaybackSpeed()
-            saveState()
-            showToast("Playback speed changed: " .. currentPlaybackSpeed .. "x")
-            if parentMenu == "settings" then showAudioSettingsMenu() else showMoreOptions() end
-        end
+        currentPlaybackSpeed = availableSpeeds[w + 1]
+        applyPlaybackSpeed()
+        saveState()
+        showToast("Playback speed changed: " .. currentPlaybackSpeed .. "x")
+        if parentMenu == "settings" then showAudioSettingsMenu() else showMoreOptions() end
     end)
     local backFunc = function()
         if parentMenu == "settings" then showAudioSettingsMenu() else showMoreOptions() end
@@ -986,7 +1076,7 @@ showBrowseModeMenu = function(storagePath, mediaType)
     showDialogSafe(builder, function() showMediaTypeMenu(storagePath) end)
 end
 
--- 6. Unified Media List Engine
+-- 6. Unified Media List Engine with In-Place Update & Fixed Layout Width Actions
 renderMediaList = function(currentPath, mediaType)
     if currentPath == "/storage" then
         local autoSd = getExternalSdCardPath()
@@ -1019,13 +1109,15 @@ renderMediaList = function(currentPath, mediaType)
                         pcall(function() isDir = f.isDirectory() end)
                         local time = 0
                         pcall(function() time = f.lastModified() end)
+                        local size = 0
+                        if not isDir then pcall(function() size = f.length() end) end
                         if isDir then
                             if currentPath == "/storage" or hasMedia(f, mediaType, 1) then
-                                table.insert(rawItems, {name = name, path = f.getAbsolutePath(), isDir = true, time = time})
+                                table.insert(rawItems, {name = name, path = f.getAbsolutePath(), isDir = true, time = time, size = 0})
                             end
                         else
                             if matchesFormat(name, mediaType) then
-                                table.insert(rawItems, {name = name, path = f.getAbsolutePath(), isDir = false, time = time})
+                                table.insert(rawItems, {name = name, path = f.getAbsolutePath(), isDir = false, time = time, size = size})
                             end
                         end
                     end
@@ -1037,13 +1129,18 @@ renderMediaList = function(currentPath, mediaType)
                 if d.name ~= "emulated" and d.name ~= "self" and d.name ~= "sdcard0" and d.name ~= "0" then
                     local time = 0
                     pcall(function() time = File(d.path).lastModified() end)
-                    table.insert(rawItems, {name = d.name, path = d.path, isDir = true, time = time})
+                    table.insert(rawItems, {name = d.name, path = d.path, isDir = true, time = time, size = 0})
                 end
             end
             for _, f in ipairs(files) do
                 local time = 0
-                pcall(function() time = File(f.path).lastModified() end)
-                table.insert(rawItems, {name = f.name, path = f.path, isDir = false, time = time})
+                local size = 0
+                pcall(function() 
+                    local fileObj = File(f.path)
+                    time = fileObj.lastModified() 
+                    size = fileObj.length()
+                end)
+                table.insert(rawItems, {name = f.name, path = f.path, isDir = false, time = time, size = size})
             end
         end
     end
@@ -1081,132 +1178,532 @@ renderMediaList = function(currentPath, mediaType)
         end)
     end
 
-    local items = {}
-    local actions = {}
-
-    local searchString = "Search"
-    if currentSearchQuery ~= "" then searchString = "Search: " .. currentSearchQuery end
-    table.insert(items, searchString)
-    table.insert(actions, {type = "control", target = "search"})
-
-    local sortMethodsTranslations = {["A-Z"] = "A-Z", ["Z-A"] = "Z-A", ["Newest"] = "Newest First", ["Oldest"] = "Oldest First"}
-    table.insert(items, "Sort By: " .. (sortMethodsTranslations[currentSortMethod] or currentSortMethod))
-    table.insert(actions, {type = "control", target = "sort"})
-
-    if currentSearchQuery ~= "" then
-        table.insert(items, "Clear Search")
-        table.insert(actions, {type = "control", target = "clear_search"})
-    end
-
-    for _, item in ipairs(filteredList) do
-        if item.isDir then
-            table.insert(items, "[Folder] " .. item.name)
-        else
-            local icon = ""
-            if mediaType == "video" or (mediaType == "statuses" and item.name:lower():find("%.mp4$")) then
-                icon = "🎬 "
-            elseif mediaType == "statuses" then
-                icon = "🖼️ "
-            end
-            table.insert(items, icon .. item.name)
-        end
-        table.insert(actions, {type = "media", data = item})
-    end
-
     if #filteredList == 0 and currentSearchQuery == "" then
         showToast("No files found.")
         showMainMenu()
         return
     end
 
-    local builder = AlertDialog.Builder(service)
-    builder.setTitle(currentBrowseMode == "all_files" and "All Files" or "Browse Folders")
-    builder.setItems(items, function(dialog, which)
-        local selectionAction = actions[which + 1]
-        if selectionAction.type == "control" then
-            if selectionAction.target == "search" then
-                Handler(Looper.getMainLooper()).post(Runnable({
-                    run = function()
-                        local inputField = EditText(service)
-                        inputField.setHint("Search...")
-                        if currentSearchQuery ~= "" then inputField.setText(currentSearchQuery) end
-                        local searchDialog = AlertDialog.Builder(service)
-                        searchDialog.setTitle("Search")
-                        searchDialog.setView(inputField)
-                        searchDialog.setPositiveButton("Search", function()
-                            currentSearchQuery = tostring(inputField.getText())
-                            renderMediaList(currentPath, mediaType)
-                        end)
-                        searchDialog.setNegativeButton("Cancel", function()
-                            renderMediaList(currentPath, mediaType)
-                        end)
-                        showDialogSafe(searchDialog, function() renderMediaList(currentPath, mediaType) end)
-                    end
-                }))
-            elseif selectionAction.target == "sort" then
-                local sortOptions = {"A-Z", "Z-A", "Newest First", "Oldest First"}
-                local sortOptionBuilder = AlertDialog.Builder(service)
-                sortOptionBuilder.setTitle("Sort By")
-                sortOptionBuilder.setItems(sortOptions, function(d, w)
-                    if w == 0 then currentSortMethod = "A-Z"
-                    elseif w == 1 then currentSortMethod = "Z-A"
-                    elseif w == 2 then currentSortMethod = "Newest"
-                    elseif w == 3 then currentSortMethod = "Oldest" end
-                    saveState()
-                    renderMediaList(currentPath, mediaType)
-                end)
-                showDialogSafe(sortOptionBuilder, function() renderMediaList(currentPath, mediaType) end)
-            elseif selectionAction.target == "clear_search" then
-                currentSearchQuery = ""
-                renderMediaList(currentPath, mediaType)
-            end
-        elseif selectionAction.type == "media" then
-            local selectedMedia = selectionAction.data
-            if selectedMedia.isDir then
-                renderMediaList(selectedMedia.path, mediaType)
+    -- Create ArrayList for dynamic in-place updates (Fixes screen reader focus loss bug)
+    local displayItems = luajava.newInstance("java.util.ArrayList")
+    local actionItems = {}
+
+    local lvMedia = ListView(service)
+    local adapterMedia = ArrayAdapter(service, android.R.layout.simple_list_item_1, displayItems)
+    lvMedia.setAdapter(adapterMedia)
+
+    local mainLayout = LinearLayout(service)
+    mainLayout.setOrientation(LinearLayout.VERTICAL)
+    
+    local lvParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0)
+    lvMedia.setLayoutParams(lvParams)
+    mainLayout.addView(lvMedia)
+
+    local bottomBar = nil
+    local btnCancel = nil
+    local btnShare = nil
+    local btnDelete = nil
+    local mediaListDialog = nil
+
+    -- In-place updating function that keeps the screen reader focused correctly
+    local function updateListAndButtons()
+        displayItems.clear()
+        actionItems = {}
+
+        local searchString = "Search"
+        if currentSearchQuery ~= "" then searchString = "Search: " .. currentSearchQuery end
+        displayItems.add(searchString)
+        table.insert(actionItems, {type = "control", target = "search"})
+
+        local sortMethodsTranslations = {["A-Z"] = "A-Z", ["Z-A"] = "Z-A", ["Newest"] = "Newest First", ["Oldest"] = "Oldest First"}
+        displayItems.add("Sort By: " .. (sortMethodsTranslations[currentSortMethod] or currentSortMethod))
+        table.insert(actionItems, {type = "control", target = "sort"})
+
+        if currentSearchQuery ~= "" then
+            displayItems.add("Clear Search")
+            table.insert(actionItems, {type = "control", target = "clear_search"})
+        end
+
+        if isMultiSelectActive then
+            displayItems.add("[Select All]")
+            table.insert(actionItems, {type = "multiselect_control", target = "select_all"})
+        end
+
+        for _, item in ipairs(filteredList) do
+            local prefix = ""
+            if isMultiSelectActive then
+                if selectedItemsMap[item.path] then prefix = "[✓] " else prefix = "[ ] " end
             else
-                if mediaType == "statuses" and not selectedMedia.path:lower():find("%.mp4$") then
-                    openImageExternally(selectedMedia.path)
-                else
-                    currentPlaylist = {}
-                    for _, innerObj in ipairs(filteredList) do
-                        if not innerObj.isDir then
-                            if mediaType == "statuses" then
-                                if innerObj.path:lower():find("%.mp4$") then
-                                    table.insert(currentPlaylist, innerObj.path)
-                                    if innerObj.path == selectedMedia.path then
-                                        currentIndex = #currentPlaylist
-                                    end
-                                end
-                            else
-                                table.insert(currentPlaylist, innerObj.path)
-                                if innerObj.path == selectedMedia.path then
-                                    currentIndex = #currentPlaylist
-                                end
-                            end
-                        end
+                if not item.isDir then
+                    if mediaType == "video" or (mediaType == "statuses" and item.name:lower():find("%.mp4$")) then
+                        prefix = "📹 "
+                    elseif mediaType == "statuses" then
+                        prefix = "🖼️ "
                     end
-                    lastPlayedPosition = 0
-                    playMedia(selectedMedia.path, true)
                 end
             end
-        end
-    end)
-
-    local backFunc = function()
-        if currentBrowseMode == "all_files" then
-            showBrowseModeMenu(currentPath, mediaType)
-        else
-            local parentDir = File(currentPath).getParent()
-            if parentDir and parentDir ~= "/storage" and parentDir ~= "/storage/emulated" and parentDir ~= "/storage/emulated/0" then
-                renderMediaList(parentDir, mediaType)
+            
+            if item.isDir then
+                displayItems.add(prefix .. "[Folder] " .. item.name)
+                table.insert(actionItems, {type = "media", data = item})
             else
-                showBrowseModeMenu(currentPath, mediaType)
+                displayItems.add(prefix .. item.name)
+                table.insert(actionItems, {type = "media", data = item})
+            end
+        end
+
+        adapterMedia.notifyDataSetChanged()
+
+        if isMultiSelectActive and btnShare and btnDelete then
+            local selCount, selSizeStr = getSelectedStats(filteredList, selectedItemsMap)
+            btnShare.setText(string.format("Share (%d items, %s)", selCount, selSizeStr))
+            btnDelete.setText(string.format("Delete (%d items, %s)", selCount, selSizeStr))
+            
+            -- Dynamic Visibility Check: Hide share button if any folder is selected
+            local hasFolderSelected = false
+            for _, item in ipairs(filteredList) do
+                if selectedItemsMap[item.path] and item.isDir then
+                    hasFolderSelected = true
+                    break
+                end
+            end
+            if hasFolderSelected then
+                btnShare.setVisibility(View.GONE)
+            else
+                btnShare.setVisibility(View.VISIBLE)
             end
         end
     end
+
+    -- Setup Bottom Actions row layout for multi-select (Fixed Width to avoid pushing Delete off-screen)
+    if isMultiSelectActive then
+        bottomBar = LinearLayout(service)
+        bottomBar.setOrientation(LinearLayout.HORIZONTAL)
+        bottomBar.setGravity(Gravity.RIGHT)
+        local barParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        bottomBar.setLayoutParams(barParams)
+
+        local wrapParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        local weightParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+
+        btnCancel = Button(service)
+        btnCancel.setText("Cancel")
+        btnCancel.setLayoutParams(wrapParams)
+        btnCancel.setOnClickListener(View.OnClickListener({
+            onClick = function(v)
+                isMultiSelectActive = false
+                selectedItemsMap = {}
+                mediaListDialog.dismiss()
+                renderMediaList(currentPath, mediaType)
+            end
+        }))
+
+        btnShare = Button(service)
+        btnShare.setLayoutParams(weightParams)
+        btnShare.setOnClickListener(View.OnClickListener({
+            onClick = function(v)
+                local sharePaths = {}
+                for _, item in ipairs(filteredList) do
+                    if not item.isDir and selectedItemsMap[item.path] then
+                        table.insert(sharePaths, item.path)
+                    end
+                end
+                if #sharePaths == 0 then
+                    showToast("No files selected to share. Folders cannot be shared directly.")
+                    return
+                end
+                saveState()
+                mediaListDialog.dismiss()
+                
+                -- Detect current package for return app monitor loop
+                local originalPackage = ""
+                pcall(function()
+                    local root = service.getRootInActiveWindow()
+                    if root then originalPackage = tostring(root.getPackageName()) end
+                end)
+                if originalPackage == "" or originalPackage == "android" or originalPackage == "com.android.intentresolver" then
+                    originalPackage = "com.android.launcher3"
+                end
+                
+                pcall(function()
+                    local context = service
+                    setStrictModeAllowFileUri()
+                    if #sharePaths == 1 then
+                        local file = File(sharePaths[1])
+                        local shareUri = Uri.fromFile(file)
+                        local intent = Intent(Intent.ACTION_SEND)
+                        intent.setType("*/*")
+                        intent.putExtra(Intent.EXTRA_STREAM, shareUri)
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        local chooser = Intent.createChooser(intent, "Share File")
+                        chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        context.startActivity(chooser)
+                    else
+                        local uris = luajava.newInstance("java.util.ArrayList")
+                        for _, path in ipairs(sharePaths) do
+                            uris.add(Uri.fromFile(File(path)))
+                        end
+                        local intent = Intent(Intent.ACTION_SEND_MULTIPLE)
+                        intent.setType("*/*")
+                        intent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        local chooser = Intent.createChooser(intent, "Share Files")
+                        chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        context.startActivity(chooser)
+                    end
+                end)
+                
+                -- App Monitor Loop for Multiple Sharing safely without changing original logic
+                local monitorHandler = Handler(Looper.getMainLooper())
+                local monitorRunnable
+                local loopCount = 0
+                local hasLeftApp = false
+                
+                monitorRunnable = Runnable({
+                    run = function()
+                        loopCount = loopCount + 1
+                        local currentPkg = ""
+                        pcall(function()
+                            local root = service.getRootInActiveWindow()
+                            if root then currentPkg = tostring(root.getPackageName()) end
+                        end)
+                        local currentPkgLower = currentPkg:lower()
+                        
+                        if currentPkg ~= "" and currentPkg ~= originalPackage and not currentPkgLower:find("launcher") and not currentPkgLower:find("home") then
+                            hasLeftApp = true
+                        end
+                        
+                        if hasLeftApp and (currentPkg == originalPackage or currentPkgLower:find("launcher") or currentPkgLower:find("home")) then
+                            Handler(Looper.getMainLooper()).post(Runnable({
+                                run = function() 
+                                    if currentFilePath and currentFilePath ~= "" then
+                                        showPlayerControls()
+                                    else
+                                        renderMediaList(currentPath, mediaType)
+                                    end
+                                end
+                            }))
+                        elseif not hasLeftApp and loopCount > 10 then
+                            Handler(Looper.getMainLooper()).post(Runnable({
+                                run = function()
+                                    if currentFilePath and currentFilePath ~= "" then
+                                        showPlayerControls()
+                                    else
+                                        renderMediaList(currentPath, mediaType)
+                                    end
+                                end
+                            }))
+                        elseif loopCount < 120 then
+                            monitorHandler.postDelayed(monitorRunnable, 1000)
+                        end
+                    end
+                })
+                monitorHandler.postDelayed(monitorRunnable, 1000)
+                
+                isMultiSelectActive = false
+                selectedItemsMap = {}
+            end
+        }))
+
+        btnDelete = Button(service)
+        btnDelete.setLayoutParams(weightParams)
+        btnDelete.setOnClickListener(View.OnClickListener({
+            onClick = function(v)
+                local selCount, selSizeStr = getSelectedStats(filteredList, selectedItemsMap)
+                if selCount == 0 then
+                    showToast("No items selected.")
+                else
+                    local confSelDel = AlertDialog.Builder(service)
+                    confSelDel.setTitle("Confirm Deletion")
+                    confSelDel.setMessage(string.format("Are you sure you want to permanently delete %d selected items (%s)?", selCount, selSizeStr))
+                    confSelDel.setPositiveButton("Delete All", function()
+                        mediaListDialog.dismiss()
+                        showToast("Deleting selected items...")
+                        
+                        -- Non-blocking Thread Execution to avoid phone hang
+                        Thread(Runnable({
+                            run = function()
+                                local resetPlayer = false
+                                for _, item in ipairs(filteredList) do
+                                    if selectedItemsMap[item.path] and currentFilePath == item.path then
+                                        resetPlayer = true
+                                    end
+                                end
+                                if resetPlayer then
+                                    Handler(Looper.getMainLooper()).post(Runnable({
+                                        run = function() player.reset() cancelNotification() end
+                                    }))
+                                    _G.smart_player_is_prepared = false
+                                    _G.smart_player_current_path = ""
+                                    currentFilePath = "" lastPlayedPosition = 0
+                                end
+
+                                local successCount = 0
+                                for _, item in ipairs(filteredList) do
+                                    if selectedItemsMap[item.path] then
+                                        local targetFile = File(item.path)
+                                        if item.isDir then
+                                            if deleteFolderRecursive(targetFile) then successCount = successCount + 1 end
+                                        else
+                                            if targetFile.delete() then successCount = successCount + 1 end
+                                        end
+                                    end
+                                end
+                                
+                                Handler(Looper.getMainLooper()).post(Runnable({
+                                    run = function()
+                                        showToast(successCount .. " items deleted successfully.")
+                                        isMultiSelectActive = false
+                                        selectedItemsMap = {}
+                                        saveState()
+                                        if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
+                                        renderMediaList(currentPath, mediaType)
+                                    end
+                                }))
+                            end
+                        })).start()
+                    end)
+                    confSelDel.setNegativeButton("Cancel", nil)
+                    showDialogSafe(confSelDel, function() end)
+                end
+            end
+        }))
+
+        bottomBar.addView(btnCancel)
+        bottomBar.addView(btnShare)
+        bottomBar.addView(btnDelete)
+        mainLayout.addView(bottomBar)
+    end
+
+    updateListAndButtons()
+
+    local builder = AlertDialog.Builder(service)
+    builder.setTitle(currentBrowseMode == "all_files" and "All Files" or "Browse Folders")
+    builder.setView(mainLayout)
+
+    lvMedia.setOnItemClickListener(AdapterView.OnItemClickListener({
+        onItemClick = function(parent, view, position, id)
+            local action = actionItems[position + 1]
+            if not action then return end
+            
+            if action.type == "control" then
+                if action.target == "search" then
+                    mediaListDialog.dismiss()
+                    Handler(Looper.getMainLooper()).post(Runnable({
+                        run = function()
+                            local inputField = EditText(service)
+                            inputField.setHint("Search...")
+                            if currentSearchQuery ~= "" then inputField.setText(currentSearchQuery) end
+                            local searchDialog = AlertDialog.Builder(service)
+                            searchDialog.setTitle("Search")
+                            searchDialog.setView(inputField)
+                            searchDialog.setPositiveButton("Search", function()
+                                currentSearchQuery = tostring(inputField.getText())
+                                renderMediaList(currentPath, mediaType)
+                            end)
+                            searchDialog.setNegativeButton("Cancel", function()
+                                renderMediaList(currentPath, mediaType)
+                            end)
+                            showDialogSafe(searchDialog, function() renderMediaList(currentPath, mediaType) end)
+                        end
+                    }))
+                elseif action.target == "sort" then
+                    mediaListDialog.dismiss()
+                    local sortOptions = {"A-Z", "Z-A", "Newest First", "Oldest First"}
+                    local sortOptionBuilder = AlertDialog.Builder(service)
+                    sortOptionBuilder.setTitle("Sort By")
+                    sortOptionBuilder.setItems(sortOptions, function(d, w)
+                        if w == 0 then currentSortMethod = "A-Z"
+                        elseif w == 1 then currentSortMethod = "Z-A"
+                        elseif w == 2 then currentSortMethod = "Newest"
+                        elseif w == 3 then currentSortMethod = "Oldest" end
+                        saveState()
+                        renderMediaList(currentPath, mediaType)
+                    end)
+                    showDialogSafe(sortOptionBuilder, function() renderMediaList(currentPath, mediaType) end)
+                elseif action.target == "clear_search" then
+                    currentSearchQuery = ""
+                    mediaListDialog.dismiss()
+                    renderMediaList(currentPath, mediaType)
+                end
+            elseif action.type == "multiselect_control" then
+                if action.target == "select_all" then
+                    for _, item in ipairs(filteredList) do
+                        selectedItemsMap[item.path] = true
+                    end
+                    updateListAndButtons()
+                end
+            elseif action.type == "media" then
+                local selectedMedia = action.data
+                if isMultiSelectActive then
+                    selectedItemsMap[selectedMedia.path] = not selectedItemsMap[selectedMedia.path]
+                    if selectedItemsMap[selectedMedia.path] then
+                        service.speak("Checked")
+                    else
+                        service.speak("Not checked")
+                    end
+                    updateListAndButtons() 
+                else
+                    if selectedMedia.isDir then
+                        mediaListDialog.dismiss()
+                        renderMediaList(selectedMedia.path, mediaType)
+                    else
+                        if mediaType == "statuses" and not selectedMedia.path:lower():find("%.mp4$") then
+                            openImageExternally(selectedMedia.path)
+                        else
+                            mediaListDialog.dismiss()
+                            currentPlaylist = {}
+                            for _, innerObj in ipairs(filteredList) do
+                                if not innerObj.isDir then
+                                    if mediaType == "statuses" then
+                                        if innerObj.path:lower():find("%.mp4$") then
+                                            table.insert(currentPlaylist, innerObj.path)
+                                            if innerObj.path == selectedMedia.path then currentIndex = #currentPlaylist end
+                                        end
+                                    else
+                                        table.insert(currentPlaylist, innerObj.path)
+                                        if innerObj.path == selectedMedia.path then currentIndex = #currentPlaylist end
+                                    end
+                                end
+                            end
+                            lastPlayedPosition = 0
+                            playMedia(selectedMedia.path, true)
+                        end
+                    end
+                end
+            end
+        end
+    }))
+
+    lvMedia.setOnItemLongClickListener(AdapterView.OnItemLongClickListener({
+        onItemLongClick = function(parent, view, position, id)
+            local action = actionItems[position + 1]
+            if action and action.type == "media" then
+                local targetMedia = action.data
+                if multiSelectSetting == "on" then
+                    if not isMultiSelectActive then
+                        isMultiSelectActive = true
+                        selectedItemsMap = {}
+                        selectedItemsMap[targetMedia.path] = true
+                        showToast("Multi-select mode enabled.")
+                        mediaListDialog.dismiss()
+                        renderMediaList(currentPath, mediaType)
+                    end
+                else
+                    local confSingleDel = AlertDialog.Builder(service)
+                    confSingleDel.setTitle("Delete Item?")
+                    
+                    local msg = "Are you sure you want to permanently delete: " .. targetMedia.name .. "?"
+                    if targetMedia.isDir then
+                        local totalSize = getFolderSizeRecursive(File(targetMedia.path))
+                        local sizeStr = formatSize(totalSize)
+                        msg = "Do you want to delete this folder: " .. targetMedia.name .. " (" .. sizeStr .. ")?"
+                    end
+                    confSingleDel.setMessage(msg)
+                    
+                    confSingleDel.setPositiveButton("Delete", function()
+                        showToast("Deleting...")
+                        Thread(Runnable({
+                            run = function()
+                                local targetFile = File(targetMedia.path)
+                                local deleted = false
+                                if targetMedia.isDir then
+                                    deleted = deleteFolderRecursive(targetFile)
+                                else
+                                    deleted = targetFile.delete()
+                                end
+                                
+                                Handler(Looper.getMainLooper()).post(Runnable({
+                                    run = function()
+                                        if deleted then
+                                            showToast("Deleted successfully.")
+                                            if currentFilePath == targetMedia.path then
+                                                player.reset() cancelNotification()
+                                                currentFilePath = "" lastPlayedPosition = 0 saveState()
+                                                if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
+                                            end
+                                            mediaListDialog.dismiss()
+                                            renderMediaList(currentPath, mediaType)
+                                        else
+                                            showToast("Failed to delete.")
+                                        end
+                                    end
+                                }))
+                            end
+                        })).start()
+                    end)
+                    confSingleDel.setNegativeButton("Cancel", nil)
+                    showDialogSafe(confSingleDel)
+                end
+            end
+            return true
+        end
+    }))
+
+    local backFunc = function()
+        if isMultiSelectActive then
+            isMultiSelectActive = false
+            selectedItemsMap = {}
+            mediaListDialog.dismiss()
+            renderMediaList(currentPath, mediaType)
+        else
+            mediaListDialog.dismiss()
+            
+            local pathStr = tostring(currentPath)
+            if pathStr:find("WhatsApp/Media") then
+                local name = File(currentPath).getName()
+                if name == "WhatsApp Audio" or name == "WhatsApp Voice Notes" or name == "WhatsApp Video" or name == ".Statuses" then
+                    showWhatsAppMenu()
+                    return
+                end
+            end
+            
+            if currentBrowseMode == "all_files" then
+                local baseStorage = "/storage/emulated/0"
+                local sdPath = getExternalSdCardPath()
+                if sdPath and pathStr:sub(1, #sdPath) == sdPath then baseStorage = sdPath end
+                showBrowseModeMenu(baseStorage, mediaType)
+            else
+                local sdPath = getExternalSdCardPath()
+                if currentPath == "/storage/emulated/0" or (sdPath and currentPath == sdPath) then
+                    local baseStorage = "/storage/emulated/0"
+                    if sdPath and pathStr:sub(1, #sdPath) == sdPath then baseStorage = sdPath end
+                    showBrowseModeMenu(baseStorage, mediaType)
+                else
+                    local parentDir = File(currentPath).getParent()
+                    if parentDir and parentDir ~= "/storage" and parentDir ~= "/storage/emulated" then
+                        renderMediaList(parentDir, mediaType)
+                    else
+                        local baseStorage = "/storage/emulated/0"
+                        if sdPath and pathStr:sub(1, #sdPath) == sdPath then baseStorage = sdPath end
+                        showBrowseModeMenu(baseStorage, mediaType)
+                    end
+                end
+            end
+        end
+    end
+    
     builder.setNegativeButton("Back", backFunc)
-    showDialogSafe(builder, backFunc)
+    
+    Handler(Looper.getMainLooper()).post(Runnable({
+        run = function()
+            mediaListDialog = builder.create()
+            mediaListDialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+            import "android.view.KeyEvent"
+            mediaListDialog.setOnKeyListener(DialogInterface.OnKeyListener({
+                onKey = function(d, keyCode, event)
+                    if keyCode == KeyEvent.KEYCODE_BACK and event.getAction() == KeyEvent.ACTION_UP then
+                        backFunc()
+                        return true
+                    end
+                    return false
+                end
+            }))
+            mediaListDialog.show()
+        end
+    }))
 end
 
 -- 7. Media Playback Function
@@ -1294,6 +1791,7 @@ showPlayerControls = function()
 
             if currentSavedMediaType == "video" or currentSavedMediaType == "statuses" then
                 local surfaceView = SurfaceView(context)
+                surfaceView.setKeepScreenOn(true)
                 local lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 550)
                 lp.setMargins(0, 10, 0, 15)
                 surfaceView.setLayoutParams(lp)
@@ -1325,7 +1823,6 @@ showPlayerControls = function()
             spaceBeforeRow.setPadding(0, 0, 0, 10)
             layout.addView(spaceBeforeRow)
 
-            -- Dynamic Buttons Layout (Sleep Mode & Volume Boost)
             local rowBoostSleep = LinearLayout(context)
             rowBoostSleep.setOrientation(LinearLayout.HORIZONTAL)
             rowBoostSleep.setGravity(Gravity.CENTER)
@@ -1420,12 +1917,10 @@ showPlayerControls = function()
                     if targetPos < 0 then targetPos = 0 end
                     player.seekTo(targetPos)
                     saveState()
-                    showToast("Rewind " .. math.floor(ffRwDuration / 1000))
                 end
             }))
             layout.addView(btnRewind)
 
-            -- Play / Pause Button
             local btnPlayPause = Button(context)
             btnPlayPauseRef = btnPlayPause
             local isPlaying = false
@@ -1459,7 +1954,6 @@ showPlayerControls = function()
                     if targetPos > totalDur then targetPos = totalDur - 1000 end
                     player.seekTo(targetPos)
                     saveState()
-                    showToast("Fast Forward " .. math.floor(ffRwDuration / 1000))
                 end
             }))
             layout.addView(btnFF)
@@ -1490,7 +1984,9 @@ showPlayerControls = function()
                 onClick = function(v)
                     saveState()
                     if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
-                    renderMediaList(currentSavedFolder, currentSavedMediaType)
+                    isMultiSelectActive = false
+                    selectedItemsMap = {}
+                    showStorageMenu()
                 end
             }))
             layout.addView(btnFolder)
@@ -1540,6 +2036,10 @@ showPlayerControls = function()
             controlsDialog = builder.create()
             controlsDialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
             
+            if currentSavedMediaType == "video" or currentSavedMediaType == "statuses" then
+                controlsDialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            end
+            
             import "android.view.KeyEvent"
             controlsDialog.setOnKeyListener(DialogInterface.OnKeyListener({
                 onKey = function(dialog, keyCode, event)
@@ -1547,16 +2047,23 @@ showPlayerControls = function()
                         controlsDialog.dismiss()
                         controlsDialog = nil
                         saveState()
-                        _G.smart_player_minimized = true
-                        if backgroundPlay == "on" then
-                            showNotification(File(currentFilePath).getName())
+                        
+                        if currentSavedFolder and currentSavedFolder ~= "" then
+                            isMultiSelectActive = false
+                            selectedItemsMap = {}
+                            renderMediaList(currentSavedFolder, currentSavedMediaType)
                         else
-                            pcall(function() 
-                                if player.isPlaying() then player.pause() end 
-                                lastPlayedPosition = player.getCurrentPosition() 
-                            end)
-                            _G.smart_player_is_prepared = true
-                            saveState() cancelNotification()
+                            _G.smart_player_minimized = true
+                            if backgroundPlay == "on" then
+                                showNotification(File(currentFilePath).getName())
+                            else
+                                pcall(function() 
+                                    if player.isPlaying() then player.pause() end 
+                                    lastPlayedPosition = player.getCurrentPosition() 
+                                end)
+                                _G.smart_player_is_prepared = true
+                                saveState() cancelNotification()
+                            end
                         end
                         return true
                     end
@@ -1632,17 +2139,15 @@ startSeekBarUpdate = function()
     handler.post(updateRunnable)
 end
 
--- 10. More Options Menu (Modified: Added Save to Gallery for statuses)
+-- 10. More Options Menu 
 showMoreOptions = function()
     local file = File(currentFilePath)
-    local options = {"Delete", "Share", "Playback Speed"}
-    -- Add Save to Gallery option only if current media is a status
+    local options = {"Delete", "Share", "Playback Speed", "Rename"}
     if currentSavedMediaType == "statuses" then
-        table.insert(options, 1, "Save to Gallery")  -- insert at beginning
+        table.insert(options, 1, "Save to Gallery")
     end
     local builder = AlertDialog.Builder(service)
     builder.setItems(options, function(dialog, which)
-        -- Adjust index because we may have inserted an extra option
         local idx = which + 1
         if currentSavedMediaType == "statuses" then
             if idx == 1 then
@@ -1653,8 +2158,7 @@ showMoreOptions = function()
             end
         end
         if idx == 1 then
-            -- Delete
-            if file.isDirectory() then showToast("Cannot delete folders.") return end
+            if file.isDirectory() then showToast("Cannot delete folders here.") return end
             local confirm = AlertDialog.Builder(service)
             confirm.setTitle("Delete File?")
             confirm.setMessage("Are you sure you want to permanently delete this file?")
@@ -1662,17 +2166,26 @@ showMoreOptions = function()
                 player.reset() cancelNotification()
                 _G.smart_player_is_prepared = false
                 _G.smart_player_current_path = ""
-                if file.delete() then
-                    showToast("File deleted successfully.")
-                    currentFilePath = "" lastPlayedPosition = 0 saveState()
-                    if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
-                    renderMediaList(currentSavedFolder, currentSavedMediaType)
-                else showToast("Failed to delete file.") end
+                
+                Thread(Runnable({
+                    run = function()
+                        local isDeleted = file.delete()
+                        Handler(Looper.getMainLooper()).post(Runnable({
+                            run = function()
+                                if isDeleted then
+                                    showToast("File deleted successfully.")
+                                    currentFilePath = "" lastPlayedPosition = 0 saveState()
+                                    if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
+                                    renderMediaList(currentSavedFolder, currentSavedMediaType)
+                                else showToast("Failed to delete file.") end
+                            end
+                        }))
+                    end
+                })).start()
             end)
             confirm.setNegativeButton("Cancel", nil)
             showDialogSafe(confirm, function() showMoreOptions() end)
         elseif idx == 2 then
-            -- Share
             saveState()
             local originalPackage = ""
             pcall(function()
@@ -1687,23 +2200,8 @@ showMoreOptions = function()
 
             pcall(function()
                 local context = service
-                local shareUri = nil
-                pcall(function()
-                    local resolver = context.getContentResolver()
-                    local projection = {MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DATA}
-                    local selection = MediaStore.MediaColumns.DATA .. "=?"
-                    local selArgs = {currentFilePath}
-                    local cursor = resolver.query(MediaStore.Files.getContentUri("external"), projection, selection, selArgs, nil)
-                    if cursor and cursor.moveToFirst() then
-                        local id = cursor.getLong(cursor.getColumnIndex(MediaStore.MediaColumns._ID))
-                        shareUri = MediaStore.Files.getContentUri("external", id)
-                        cursor.close()
-                    end
-                end)
-                if not shareUri then
-                    setStrictModeAllowFileUri()
-                    shareUri = Uri.fromFile(file)
-                end
+                setStrictModeAllowFileUri()
+                local shareUri = Uri.fromFile(file)
                 local intent = Intent(Intent.ACTION_SEND)
                 intent.setType("*/*")
                 intent.putExtra(Intent.EXTRA_STREAM, shareUri)
@@ -1735,11 +2233,23 @@ showMoreOptions = function()
                     
                     if hasLeftApp and (currentPkg == originalPackage or currentPkgLower:find("launcher") or currentPkgLower:find("home")) then
                         Handler(Looper.getMainLooper()).post(Runnable({
-                            run = function() showPlayerControls() end
+                            run = function() 
+                                if currentFilePath and currentFilePath ~= "" then
+                                    showPlayerControls()
+                                else
+                                    renderMediaList(currentSavedFolder, currentSavedMediaType)
+                                end
+                            end
                         }))
                     elseif not hasLeftApp and loopCount > 10 then
                         Handler(Looper.getMainLooper()).post(Runnable({
-                            run = function() showPlayerControls() end
+                            run = function()
+                                if currentFilePath and currentFilePath ~= "" then
+                                    showPlayerControls()
+                                else
+                                    renderMediaList(currentSavedFolder, currentSavedMediaType)
+                                end
+                            end
                         }))
                     elseif loopCount < 120 then
                         monitorHandler.postDelayed(monitorRunnable, 1000)
@@ -1748,117 +2258,41 @@ showMoreOptions = function()
             })
             monitorHandler.postDelayed(monitorRunnable, 1000)
         elseif idx == 3 then
-            showPlaybackSpeedMenu("more_options")
+            showPlaybackSpeedMenu("player")
+        elseif idx == 4 then
+            Handler(Looper.getMainLooper()).post(Runnable({
+                run = function()
+                    local inputField = EditText(service)
+                    inputField.setText(file.getName())
+                    local renameDialog = AlertDialog.Builder(service)
+                    renameDialog.setTitle("Rename File")
+                    renameDialog.setView(inputField)
+                    renameDialog.setPositiveButton("Rename", function()
+                        local newName = tostring(inputField.getText())
+                        if newName ~= "" then
+                            local parent = file.getParentFile()
+                            local newFile = File(parent, newName)
+                            if file.renameTo(newFile) then
+                                showToast("Renamed successfully.")
+                                currentFilePath = newFile.getAbsolutePath()
+                                saveState()
+                                showPlayerControls()
+                            else
+                                showToast("Failed to rename.")
+                                showPlayerControls()
+                            end
+                        end
+                    end)
+                    renameDialog.setNegativeButton("Cancel", function() showPlayerControls() end)
+                    showDialogSafe(renameDialog, function() showPlayerControls() end)
+                end
+            }))
         end
     end)
-    builder.setNegativeButton("Back", nil)
+    builder.setNegativeButton("Cancel", function() showPlayerControls() end)
     showDialogSafe(builder, function() showPlayerControls() end)
 end
 
-----------------------------------------------------------------------
--- Boot Initialization Engine
-----------------------------------------------------------------------
+-- Initialize Engine Initialization State Loops
 loadState()
-_G.smart_player_minimized = false
-
-if currentFilePath and currentFilePath ~= "" and File(currentFilePath).exists() then
-    local needInit = true
-    pcall(function()
-        if _G.smart_player_is_prepared and _G.smart_player_current_path == currentFilePath then
-            needInit = false
-        end
-    end)
-    
-    if needInit then
-        pcall(function()
-            player.reset()
-            player.setDataSource(currentFilePath)
-            player.prepare()
-            _G.smart_player_is_prepared = true
-            _G.smart_player_current_path = currentFilePath
-            if lastPlayedPosition > 0 then player.seekTo(lastPlayedPosition) end
-        end)
-    else
-        pcall(function()
-            if not player.isPlaying() and lastPlayedPosition > 0 then
-                player.seekTo(lastPlayedPosition)
-            end
-        end)
-    end
-
-    pcall(function()
-        loudnessEnhancer = LoudnessEnhancer(player.getAudioSessionId())
-        applyVolumeBoost(true)
-        applyPlaybackSpeed()
-    end)
-    
-    player.setOnCompletionListener(MediaPlayer.OnCompletionListener({
-        onCompletion = function(mp)
-            if autoPlay == "on" then
-                if currentIndex < #currentPlaylist then
-                    currentIndex = currentIndex + 1
-                    lastPlayedPosition = 0
-                    playMedia(currentPlaylist[currentIndex], true)
-                else
-                    cancelNotification()
-                    if btnPlayPauseRef then btnPlayPauseRef.setText("Play") end
-                end
-            else
-                cancelNotification()
-                if btnPlayPauseRef then btnPlayPauseRef.setText("Play") end
-            end
-        end
-    }))
-    
-    showPlayerControls()
-    
-    -- Sync Playlist in Background Thread
-    Handler(Looper.getMainLooper()).post(Runnable({
-        run = function()
-            pcall(function()
-                local rawFiles = {}
-                if currentBrowseMode == "all_files" then
-                    rawFiles = getAllRecursiveFiles(currentSavedFolder, currentSavedMediaType)
-                else
-                    local folderFile = File(currentSavedFolder)
-                    local list = folderFile.listFiles()
-                    if list then
-                        for i = 0, #list - 1 do
-                            local f = list[i]
-                            local name = f.getName()
-                            if (currentSavedMediaType == "statuses" or not name:find("^%.")) and not f.isDirectory() and matchesFormat(name, currentSavedMediaType) then
-                                local time = 0
-                                pcall(function() time = f.lastModified() end)
-                                table.insert(rawFiles, {name = name, path = f.getAbsolutePath(), time = time})
-                            end
-                        end
-                    end
-                end
-                
-                if currentSortMethod == "A-Z" then
-                    table.sort(rawFiles, function(a, b) return a.name:lower() < b.name:lower() end)
-                elseif currentSortMethod == "Z-A" then
-                    table.sort(rawFiles, function(a, b) return a.name:lower() > b.name:lower() end)
-                elseif currentSortMethod == "Newest" then
-                    table.sort(rawFiles, function(a, b) return (a.time or 0) > (b.time or 0) end)
-                elseif currentSortMethod == "Oldest" then
-                    table.sort(rawFiles, function(a, b) return (a.time or 0) < (b.time or 0) end)
-                end
-
-                currentPlaylist = {}
-                for _, fObj in ipairs(rawFiles) do
-                    table.insert(currentPlaylist, fObj.path)
-                end
-
-                for idx, path in ipairs(currentPlaylist) do
-                    if path == currentFilePath then
-                        currentIndex = idx
-                        break
-                    end
-                end
-            end)
-        end
-    }))
-else
-    showMainMenu()
-end
+showMainMenu()
