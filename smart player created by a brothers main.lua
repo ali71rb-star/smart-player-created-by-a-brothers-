@@ -39,6 +39,8 @@ import "android.widget.ListView"
 import "android.widget.ArrayAdapter"
 import "android.widget.AdapterView"
 import "java.lang.Thread"
+import "java.net.URLEncoder"
+import "android.widget.Toast"
 
 -- Helper to create byte array (works in all LuaJava environments)
 local function newByteArray(size)
@@ -62,13 +64,52 @@ if not _G.smart_media_player then
 end
 local player = _G.smart_media_player
 
+-- Global Playlist Persistence to fix Next/Previous issue after minimizing
+if not _G.smart_media_player_playlist then
+    _G.smart_media_player_playlist = {}
+end
+if not _G.smart_media_player_index then
+    _G.smart_media_player_index = 1
+end
+
 -- Persistent custom FF/RW dynamic configurations storage
 if not _G.ffRwOptions then
     _G.ffRwOptions = {5000, 10000, 20000, 30000, 60000}
 end
 
-local currentPlaylist = {}
-local currentIndex = 1
+-- Persistent Favorites Initialization
+local favoritesPath = "/sdcard/smart_player_favorites.txt"
+if not _G.smart_player_favorites then
+    _G.smart_player_favorites = {}
+end
+
+local function loadFavorites()
+    _G.smart_player_favorites = {}
+    pcall(function()
+        local f = io.open(favoritesPath, "r")
+        if f then
+            for line in f:lines() do
+                if line and line ~= "" then
+                    _G.smart_player_favorites[line] = true
+                end
+            end
+            f:close()
+        end
+    end)
+end
+
+local function saveFavorites()
+    pcall(function()
+        local f = io.open(favoritesPath, "w")
+        if f then
+            for path, _ in pairs(_G.smart_player_favorites) do
+                f:write(path .. "\n")
+            end
+            f:close()
+        end
+    end)
+end
+
 local currentFilePath = ""
 local currentSavedFolder = "/storage/emulated/0"
 local currentSavedMediaType = "audio"
@@ -85,6 +126,7 @@ local showSleepTimerToggle = "on"
 local showStatusImages = "on"
 local showStatusVideos = "on"
 local multiSelectSetting = "on"
+local showFavoriteButtonToggle = "on"
 
 -- Search, Sort & Browse Engine States
 local currentSortMethod = "A-Z"
@@ -117,7 +159,12 @@ local btnSleepToggleRef = nil
 local btnPlayPauseRef = nil
 
 local function showToast(text)
-    service.speak(text)
+    pcall(function()
+        Toast.makeText(service, text, Toast.LENGTH_LONG).show()
+    end)
+    pcall(function()
+        service.speak(text)
+    end)
 end
 
 -- Native Playback Speed Applier
@@ -154,6 +201,49 @@ local function applyVolumeBoost(silent)
             loudnessEnhancer.setTargetGain(4000)
             if btnVolumeBoostRef then btnVolumeBoostRef.setText("Volume Boost: 3.0x") end
             if not silent then showToast("Volume Boost: 3.0x") end
+        end
+    end)
+end
+
+-- Persistent Storage: Save State
+local function saveState()
+    pcall(function()
+        local f = io.open(configPath, "w")
+        if f then
+            f:write((currentSavedFolder or "/storage/emulated/0") .. "\n")
+            f:write((currentSavedMediaType or "audio") .. "\n")
+            f:write((currentFilePath or "") .. "\n")
+            local pos = 0
+            if player and currentFilePath ~= "" and _G.smart_player_is_prepared then 
+                pcall(function() pos = player.getCurrentPosition() end) 
+            end
+            if pos <= 0 and lastPlayedPosition > 0 then pos = lastPlayedPosition end
+            f:write(tostring(pos) .. "\n")
+            f:write(tostring(ffRwDuration) .. "\n")
+            f:write((backgroundPlay or "on") .. "\n")
+            f:write((autoPlay or "on") .. "\n")
+            f:write(tostring(sleepDurationMs or 0) .. "\n")
+            f:write(tostring(currentPlaybackSpeed or 1.0) .. "\n")
+            f:write((showWhatsAppMediaToggle or "on") .. "\n")
+            f:write((currentSortMethod or "A-Z") .. "\n")
+            f:write((currentBrowseMode or "folders") .. "\n")
+            f:write((showVolumeBoostToggle or "on") .. "\n")
+            f:write((showSleepTimerToggle or "on") .. "\n")
+            f:write((showStatusImages or "on") .. "\n")
+            f:write((showStatusVideos or "on") .. "\n")
+            f:write((multiSelectSetting or "on") .. "\n")
+            f:write((showFavoriteButtonToggle or "on") .. "\n")
+            f:close()
+        end
+    end)
+    pcall(function()
+        local f = io.open("/sdcard/smart_player_playlist.txt", "w")
+        if f then
+            f:write(tostring(_G.smart_player_index or 1) .. "\n")
+            for _, path in ipairs(_G.smart_media_player_playlist or {}) do
+                f:write(path .. "\n")
+            end
+            f:close()
         end
     end)
 end
@@ -262,7 +352,7 @@ local function formatSize(totalBytes)
     end
 end
 
--- Multi-Select Statistics Tracker (Optimized with cached pre-fetched sizes to avoid freezes)
+-- Multi-Select Statistics Tracker
 local function getSelectedStats(filteredList, selectedMap)
     local count = 0
     local totalSize = 0
@@ -282,38 +372,6 @@ local function getSelectedStats(filteredList, selectedMap)
         end
     end
     return count, formatSize(totalSize)
-end
-
--- Persistent Storage: Save State
-local function saveState()
-    pcall(function()
-        local f = io.open(configPath, "w")
-        if f then
-            f:write((currentSavedFolder or "/storage/emulated/0") .. "\n")
-            f:write((currentSavedMediaType or "audio") .. "\n")
-            f:write((currentFilePath or "") .. "\n")
-            local pos = 0
-            if player and currentFilePath ~= "" and _G.smart_media_player_is_prepared then 
-                pcall(function() pos = player.getCurrentPosition() end) 
-            end
-            if pos <= 0 and lastPlayedPosition > 0 then pos = lastPlayedPosition end
-            f:write(tostring(pos) .. "\n")
-            f:write(tostring(ffRwDuration) .. "\n")
-            f:write((backgroundPlay or "on") .. "\n")
-            f:write((autoPlay or "on") .. "\n")
-            f:write(tostring(sleepDurationMs or 0) .. "\n")
-            f:write(tostring(currentPlaybackSpeed or 1.0) .. "\n")
-            f:write((showWhatsAppMediaToggle or "on") .. "\n")
-            f:write((currentSortMethod or "A-Z") .. "\n")
-            f:write((currentBrowseMode or "folders") .. "\n")
-            f:write((showVolumeBoostToggle or "on") .. "\n")
-            f:write((showSleepTimerToggle or "on") .. "\n")
-            f:write((showStatusImages or "on") .. "\n")
-            f:write((showStatusVideos or "on") .. "\n")
-            f:write((multiSelectSetting or "on") .. "\n")
-            f:close()
-        end
-    end)
 end
 
 -- Persistent Storage: Load State
@@ -338,24 +396,50 @@ local function loadState()
             showStatusImages = f:read("*l") or "on"
             showStatusVideos = f:read("*l") or "on"
             multiSelectSetting = f:read("*l") or "on"
+            showFavoriteButtonToggle = f:read("*l") or "on"
             f:close()
         end
     end)
+    pcall(function()
+        local f = io.open("/sdcard/smart_player_playlist.txt", "r")
+        if f then
+            local idxStr = f:read("*l")
+            if idxStr then _G.smart_player_index = tonumber(idxStr) or 1 end
+            _G.smart_media_player_playlist = {}
+            for line in f:lines() do
+                if line and line ~= "" then
+                    table.insert(_G.smart_media_player_playlist, line)
+                end
+            end
+            f:close()
+        end
+    end)
+    if _G.smart_media_player_playlist and #_G.smart_media_player_playlist > 0 and currentFilePath and currentFilePath ~= "" then
+        for i, path in ipairs(_G.smart_media_player_playlist) do
+            if path == currentFilePath then
+                _G.smart_player_index = i
+                break
+            end
+        end
+    end
 end
 
--- Safe Dialog UI Launcher
+-- Safe Dialog UI Launcher (Optimized for safe Focus stability transitions)
 local function showDialogSafe(builder, onBackHandler)
     Handler(Looper.getMainLooper()).post(Runnable({
         run = function()
+            local oldDlg = _G.currentMediaListDialog
             local dialog = builder.create()
             dialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
             if onBackHandler then
                 import "android.view.KeyEvent"
                 dialog.setOnKeyListener(DialogInterface.OnKeyListener({
                     onKey = function(d, keyCode, event)
-                        if keyCode == KeyEvent.KEYCODE_BACK and event.getAction() == KeyEvent.ACTION_UP then
-                            dialog.dismiss()
-                            onBackHandler()
+                        if keyCode == KeyEvent.KEYCODE_BACK then
+                            if event.getAction() == KeyEvent.ACTION_UP then
+                                dialog.dismiss()
+                                onBackHandler()
+                            end
                             return true
                         end
                         return false
@@ -363,6 +447,7 @@ local function showDialogSafe(builder, onBackHandler)
                 }))
             end
             dialog.show()
+            if oldDlg then pcall(function() oldDlg.dismiss() end) _G.currentMediaListDialog = nil end
         end
     }))
 end
@@ -384,7 +469,7 @@ local function matchesFormat(name, mediaType)
     return false
 end
 
--- WhatsApp Status Helpers (Save, Share & Open External View Engine)
+-- WhatsApp Status Helpers
 local function openImageExternally(filePath)
     pcall(function()
         local context = service
@@ -400,7 +485,7 @@ local function openImageExternally(filePath)
     end)
 end
 
--- SAVE to Gallery using MediaStore (Android 10+ compatible) with correct byte array
+-- SAVE to Gallery using MediaStore
 local function saveStatusToGallery(filePath)
     pcall(function()
         local srcFile = File(filePath)
@@ -435,7 +520,6 @@ local function saveStatusToGallery(filePath)
             os.close()
             showToast("Status saved to Download/Saved Statuses")
         else
-            -- fallback to old method (if MediaStore fails)
             local destDir = File("/storage/emulated/0/Download/Saved Statuses")
             if not destDir.exists() then destDir.mkdirs() end
             local destFile = File(destDir, fileName)
@@ -499,7 +583,7 @@ local function getMediaStoreDirsAndFiles(rootPath, mediaType)
     return dirList, files
 end
 
--- Recursive Scanner Engine (Optimized with size projection to cache file sizes instantly)
+-- Recursive Scanner Engine
 local function getAllRecursiveFiles(rootPath, mediaType)
     local files = {}
     local resolver = service.getContentResolver()
@@ -655,7 +739,7 @@ local function getExternalSdCardPath()
     return "/storage"
 end
 
-local showMainMenu, showStorageMenu, showWhatsAppMenu, showMediaTypeMenu, showBrowseModeMenu, renderMediaList, playMedia, showPlayerControls, showMoreOptions, startSeekBarUpdate, showSettingsMenu, showAudioSettingsMenu, showSleepTimerDialog, showPlaybackSpeedMenu, showStatusSettingsMenu
+local showMainMenu, showStorageMenu, showWhatsAppMenu, showMediaTypeMenu, showBrowseModeMenu, renderMediaList, playMedia, showPlayerControls, showMoreOptions, startSeekBarUpdate, showSettingsMenu, showAudioSettingsMenu, showSleepTimerDialog, showPlaybackSpeedMenu, showStatusSettingsMenu, showAboutDialog
 
 -- 1. Main Menu
 showMainMenu = function()
@@ -723,198 +807,333 @@ showWhatsAppMenu = function()
     showDialogSafe(builder, function() showMainMenu() end)
 end
 
--- 2. Master Settings Menu
+-- 2. Master Settings Menu (In-Place Focus Stability)
 showSettingsMenu = function()
-    local items = {
-        "Audio Settings",
-        "Status Settings",
-        "Show WhatsApp Media in Main Menu: " .. showWhatsAppMediaToggle:upper(),
-        "Multi-Select Mode Setting: " .. multiSelectSetting:upper()
-    }
+    local displayItems = luajava.newInstance("java.util.ArrayList")
+    local lv = ListView(service)
+    local adapter = ArrayAdapter(service, android.R.layout.simple_list_item_1, displayItems)
+    lv.setAdapter(adapter)
+
+    local function refreshSettingsList()
+        displayItems.clear()
+        displayItems.add("Audio Settings")
+        displayItems.add("Status Settings")
+        displayItems.add("Show WhatsApp Media in Main Menu: " .. showWhatsAppMediaToggle:upper())
+        displayItems.add("Multi-Select Button: " .. multiSelectSetting:upper())
+        displayItems.add("About")
+        adapter.notifyDataSetChanged()
+    end
+    refreshSettingsList()
+
     local builder = AlertDialog.Builder(service)
     builder.setTitle("Settings")
-    builder.setItems(items, function(dialog, which)
-        if which == 0 then
-            showAudioSettingsMenu()
-        elseif which == 1 then
-            showStatusSettingsMenu()
-        elseif which == 2 then
-            if showWhatsAppMediaToggle == "on" then
-                showWhatsAppMediaToggle = "off"
-            else
-                showWhatsAppMediaToggle = "on"
+    builder.setView(lv)
+    
+    local settingsDialog = nil
+    lv.setOnItemClickListener(AdapterView.OnItemClickListener({
+        onItemClick = function(parent, view, position, id)
+            if position == 0 then
+                settingsDialog.dismiss()
+                showAudioSettingsMenu()
+            elseif position == 1 then
+                settingsDialog.dismiss()
+                showStatusSettingsMenu()
+            elseif position == 2 then
+                showWhatsAppMediaToggle = (showWhatsAppMediaToggle == "on") and "off" or "on"
+                saveState()
+                showToast("WhatsApp Media Visibility: " .. showWhatsAppMediaToggle:upper())
+                refreshSettingsList()
+            elseif position == 3 then
+                multiSelectSetting = (multiSelectSetting == "on") and "off" or "on"
+                saveState()
+                showToast("Multi-Select Button: " .. multiSelectSetting:upper())
+                refreshSettingsList()
+            elseif position == 4 then
+                settingsDialog.dismiss()
+                showAboutDialog()
             end
-            saveState()
-            showToast("WhatsApp Media Visibility: " .. showWhatsAppMediaToggle:upper())
-            showSettingsMenu()
-        elseif which == 3 then
-            if multiSelectSetting == "on" then
-                multiSelectSetting = "off"
-            else
-                multiSelectSetting = "on"
-            end
-            saveState()
-            showToast("Multi-Select Mode: " .. multiSelectSetting:upper())
-            showSettingsMenu()
         end
-    end)
+    }))
     builder.setNegativeButton("Back", function() showMainMenu() end)
-    showDialogSafe(builder, function() showMainMenu() end)
+    
+    Handler(Looper.getMainLooper()).post(Runnable({
+        run = function()
+            settingsDialog = builder.create()
+            settingsDialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+            settingsDialog.setOnKeyListener(DialogInterface.OnKeyListener({
+                onKey = function(d, keyCode, event)
+                    if keyCode == 4 then
+                        if event.getAction() == 1 then
+                            settingsDialog.dismiss()
+                            showMainMenu()
+                        end
+                        return true
+                    end
+                    return false
+                end
+            }))
+            settingsDialog.show()
+        end
+    }))
 end
 
--- Status Settings Sub-Menu
+-- About Screen
+showAboutDialog = function()
+    local builder = AlertDialog.Builder(service)
+    builder.setTitle("About Smart Player")
+    
+    local aboutText = "Smart Player\n" ..
+                      "Architected for Seamless Media Management & High-Fidelity Playback\n\n" ..
+                      "Smart Player represents a paradigm shift in mobile media interactions, meticulously designed to bridge the gap between high-performance audio/video rendering and professional file governance. Developed as a unified productivity extension, it transcends traditional playback boundaries by offering an uncompromising suite of low-level optimization parameters.\n\n" ..
+                      "At its core, Smart Player utilizes an intelligent recursive media scanning matrix that handles deep-level directory paths across internal and external storage volumes without overhead. Integrated directly with hardware-level APIs, the platform introduces native acoustic enrichment through an advanced loudness optimization engine alongside granular temporal speed controls, allowing professionals to review audio data with pristine clarity.\n\n" ..
+                      "Engineered with an intuitive yet powerful multi-select framework, it simplifies complex batch workflows—enabling automated spatial calculation, fluid interoperable file sharing, and completely safe parallel removal processes. Coupled with automated environment persistence loops and intelligent runtime handlers, Smart Player maintains your explicit operational state across sessions, delivering an elite, optimized, and distraction-free media control center."
+    
+    builder.setMessage(aboutText)
+    builder.setPositiveButton("Help & Feedback", DialogInterface.OnClickListener({
+        onClick = function(dialog, which)
+            pcall(function()
+                local msgText = "Hello, I am contacting you regarding the Smart Player Extension. Here is my feedback/suggestion: "
+                local encodedText = URLEncoder.encode(msgText, "UTF-8")
+                local url = "https://api.whatsapp.com/send?phone=923477583735&text=" .. encodedText
+                local intent = Intent(Intent.ACTION_VIEW)
+                intent.setData(Uri.parse(url))
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                service.startActivity(intent)
+            end)
+        end
+    }))
+    builder.setNegativeButton("Cancel", function() showSettingsMenu() end)
+    showDialogSafe(builder, function() showSettingsMenu() end)
+end
+
+-- Status Settings Sub-Menu (In-Place Focus Stability)
 showStatusSettingsMenu = function()
-    local items = {
-        "Show Images in Status Folder: " .. showStatusImages:upper(),
-        "Show Videos in Status Folder: " .. showStatusVideos:upper()
-    }
+    local displayItems = luajava.newInstance("java.util.ArrayList")
+    local lv = ListView(service)
+    local adapter = ArrayAdapter(service, android.R.layout.simple_list_item_1, displayItems)
+    lv.setAdapter(adapter)
+
+    local function refreshStatusSettings()
+        displayItems.clear()
+        displayItems.add("Show Images in Status Folder: " .. showStatusImages:upper())
+        displayItems.add("Show Videos in Status Folder: " .. showStatusVideos:upper())
+        adapter.notifyDataSetChanged()
+    end
+    refreshStatusSettings()
+
     local builder = AlertDialog.Builder(service)
     builder.setTitle("Status Settings")
-    builder.setItems(items, function(dialog, which)
-        if which == 0 then
-            showStatusImages = (showStatusImages == "on") and "off" or "on"
-            showToast("Images in Status: " .. showStatusImages:upper())
-        elseif which == 1 then
-            showStatusVideos = (showStatusVideos == "on") and "off" or "on"
-            showToast("Videos in Status: " .. showStatusVideos:upper())
+    builder.setView(lv)
+    
+    local statusDialog = nil
+    lv.setOnItemClickListener(AdapterView.OnItemClickListener({
+        onItemClick = function(parent, view, position, id)
+            if position == 0 then
+                showStatusImages = (showStatusImages == "on") and "off" or "on"
+                showToast("Images in Status: " .. showStatusImages:upper())
+            elseif position == 1 then
+                showStatusVideos = (showStatusVideos == "on") and "off" or "on"
+                showToast("Videos in Status: " .. showStatusVideos:upper())
+            end
+            saveState()
+            refreshStatusSettings()
         end
-        saveState()
-        showStatusSettingsMenu()
-    end)
+    }))
     builder.setNegativeButton("Back", function() showSettingsMenu() end)
-    showDialogSafe(builder, function() showSettingsMenu() end)
+    
+    Handler(Looper.getMainLooper()).post(Runnable({
+        run = function()
+            statusDialog = builder.create()
+            statusDialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+            statusDialog.setOnKeyListener(DialogInterface.OnKeyListener({
+                onKey = function(d, keyCode, event)
+                    if keyCode == 4 then
+                        if event.getAction() == 1 then
+                            statusDialog.dismiss()
+                            showSettingsMenu()
+                        end
+                        return true
+                    end
+                    return false
+                end
+            }))
+            statusDialog.show()
+        end
+    }))
 end
 
--- Audio Settings Sub-Menu
+-- Audio Settings Sub-Menu (In-Place Focus Stability)
 showAudioSettingsMenu = function()
-    local currentSec = math.floor(ffRwDuration / 1000)
-    local items = {
-        "Fast Forward and Rewind Changing Time: " .. currentSec .. " Seconds",
-        "Background Playback: " .. backgroundPlay:upper(),
-        "Auto Play Next File: " .. autoPlay:upper(),
-        "Playback Speed: " .. currentPlaybackSpeed .. "x",
-        "Set Sleep Timer Duration",
-        "Show Volume Boost on Player: " .. showVolumeBoostToggle:upper(),
-        "Show Sleep Timer on Player: " .. showSleepTimerToggle:upper()
-    }
+    local displayItems = luajava.newInstance("java.util.ArrayList")
+    local lv = ListView(service)
+    local adapter = ArrayAdapter(service, android.R.layout.simple_list_item_1, displayItems)
+    lv.setAdapter(adapter)
+
+    local function refreshAudioSettings()
+        displayItems.clear()
+        local currentSec = math.floor(ffRwDuration / 1000)
+        displayItems.add("Fast Forward and Rewind Changing Time: " .. currentSec .. " Seconds")
+        displayItems.add("Background Playback: " .. backgroundPlay:upper())
+        displayItems.add("Auto Play Next File: " .. autoPlay:upper())
+        displayItems.add("Playback Speed: " .. currentPlaybackSpeed .. "x")
+        displayItems.add("Set Sleep Timer Duration")
+        displayItems.add("Show Volume Boost on Player: " .. showVolumeBoostToggle:upper())
+        displayItems.add("Show Sleep Timer on Player: " .. showSleepTimerToggle:upper())
+        displayItems.add("Show Favorite Button in More Options: " .. showFavoriteButtonToggle:upper())
+        adapter.notifyDataSetChanged()
+    end
+    refreshAudioSettings()
+
     local builder = AlertDialog.Builder(service)
     builder.setTitle("Audio Settings")
-    builder.setItems(items, function(dialog, which)
-        if which == 0 then
-            local durItems = {}
-            local actionDurations = {}
-            for _, dur in ipairs(_G.ffRwOptions) do
-                table.insert(durItems, math.floor(dur / 1000) .. " Seconds")
-                table.insert(actionDurations, dur)
-            end
-            table.insert(durItems, "Add Custom Duration...")
-            
-            local lvDur = ListView(service)
-            local adapterDur = ArrayAdapter(service, android.R.layout.simple_list_item_1, durItems)
-            lvDur.setAdapter(adapterDur)
-            
-            local durBuilder = AlertDialog.Builder(service)
-            durBuilder.setTitle("Select FF/RW Duration (Long Press to Delete)")
-            durBuilder.setView(lvDur)
-            local durDialog = nil
-            
-            lvDur.setOnItemClickListener(AdapterView.OnItemClickListener({
-                onItemClick = function(parent, view, position, id)
-                    local idx = position + 1
-                    if idx == #durItems then
-                        durDialog.dismiss()
-                        Handler(Looper.getMainLooper()).post(Runnable({
-                            run = function()
-                                local inputField = EditText(service)
-                                inputField.setHint("Enter seconds (e.g., 25)")
-                                inputField.setInputType(InputType.TYPE_CLASS_NUMBER)
-                                
-                                local customDurBuilder = AlertDialog.Builder(service)
-                                customDurBuilder.setTitle("Enter Custom Duration")
-                                customDurBuilder.setView(inputField)
-                                customDurBuilder.setPositiveButton("Add", function()
-                                    local val = tonumber(tostring(inputField.getText()))
-                                    if val and val > 0 then
-                                        table.insert(_G.ffRwOptions, val * 1000)
-                                        ffRwDuration = val * 1000
-                                        saveState()
-                                        showToast("Duration added and selected: " .. val .. " seconds")
-                                    else
-                                        showToast("Invalid duration")
-                                    end
-                                    showAudioSettingsMenu()
-                                end)
-                                customDurBuilder.setNegativeButton("Cancel", function() showAudioSettingsMenu() end)
-                                showDialogSafe(customDurBuilder, function() showAudioSettingsMenu() end)
-                            end
-                        }))
-                    else
-                        ffRwDuration = actionDurations[idx]
-                        saveState()
-                        showToast("Duration updated to " .. math.floor(ffRwDuration / 1000) .. " seconds")
-                        durDialog.dismiss()
-                        showAudioSettingsMenu()
-                    end
+    builder.setView(lv)
+    
+    local audioDialog = nil
+    lv.setOnItemClickListener(AdapterView.OnItemClickListener({
+        onItemClick = function(parent, view, position, id)
+            if position == 0 then
+                audioDialog.dismiss()
+                local durItems = {}
+                local actionDurations = {}
+                for _, dur in ipairs(_G.ffRwOptions) do
+                    table.insert(durItems, math.floor(dur / 1000) .. " Seconds")
+                    table.insert(actionDurations, dur)
                 end
-            }))
-            
-            lvDur.setOnItemLongClickListener(AdapterView.OnItemLongClickListener({
-                onItemLongClick = function(parent, view, position, id)
-                    local idx = position + 1
-                    if idx < #durItems then
-                        local targetDel = actionDurations[idx]
-                        durDialog.dismiss()
-                        local confDel = AlertDialog.Builder(service)
-                        confDel.setTitle("Delete Duration?")
-                        confDel.setMessage("Are you sure you want to delete " .. math.floor(targetDel / 1000) .. " seconds from list?")
-                        confDel.setPositiveButton("Delete", function()
-                            table.remove(_G.ffRwOptions, idx)
-                            showToast("Duration deleted.")
+                table.insert(durItems, "Add Custom Duration...")
+                
+                local lvDur = ListView(service)
+                local adapterDur = ArrayAdapter(service, android.R.layout.simple_list_item_1, durItems)
+                lvDur.setAdapter(adapterDur)
+                
+                local durBuilder = AlertDialog.Builder(service)
+                durBuilder.setTitle("Select FF/RW Duration")
+                durBuilder.setView(lvDur)
+                local durDialog = nil
+                
+                lvDur.setOnItemClickListener(AdapterView.OnItemClickListener({
+                    onItemClick = function(parent, view, position, id)
+                        local idx = position + 1
+                        if idx == #durItems then
+                            durDialog.dismiss()
+                            Handler(Looper.getMainLooper()).post(Runnable({
+                                run = function()
+                                    local inputField = EditText(service)
+                                    inputField.setHint("Enter seconds (e.g., 25)")
+                                    inputField.setInputType(InputType.TYPE_CLASS_NUMBER)
+                                    
+                                    local customDurBuilder = AlertDialog.Builder(service)
+                                    customDurBuilder.setTitle("Enter Custom Duration")
+                                    customDurBuilder.setView(inputField)
+                                    customDurBuilder.setPositiveButton("Add", function()
+                                        local val = tonumber(tostring(inputField.getText()))
+                                        if val and val > 0 then
+                                            table.insert(_G.ffRwOptions, val * 1000)
+                                            ffRwDuration = val * 1000
+                                            saveState()
+                                            showToast("Duration added and selected: " .. val .. " seconds")
+                                        else
+                                            showToast("Invalid duration")
+                                        end
+                                        showAudioSettingsMenu()
+                                    end)
+                                    customDurBuilder.setNegativeButton("Cancel", function() showAudioSettingsMenu() end)
+                                    showDialogSafe(customDurBuilder, function() showAudioSettingsMenu() end)
+                                end
+                            }))
+                        else
+                            ffRwDuration = actionDurations[idx]
+                            saveState()
+                            showToast("Duration updated to " .. math.floor(ffRwDuration / 1000) .. " seconds")
+                            durDialog.dismiss()
                             showAudioSettingsMenu()
-                        end)
-                        confDel.setNegativeButton("Cancel", function() showAudioSettingsMenu() end)
-                        showDialogSafe(confDel, function() showAudioSettingsMenu() end)
+                        end
                     end
-                    return true
-                end
-            }))
-            
-            Handler(Looper.getMainLooper()).post(Runnable({
-                run = function()
-                    durDialog = durBuilder.create()
-                    durDialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
-                    durDialog.show()
-                end
-            }))
-            
-        elseif which == 1 then
-            if backgroundPlay == "on" then backgroundPlay = "off" cancelNotification() else backgroundPlay = "on" end
-            saveState()
-            showToast("Background playback " .. backgroundPlay)
-            showAudioSettingsMenu()
-        elseif which == 2 then
-            if autoPlay == "on" then autoPlay = "off" else autoPlay = "on" end
-            saveState()
-            showToast("Auto Play " .. autoPlay)
-            showAudioSettingsMenu()
-        elseif which == 3 then
-            showPlaybackSpeedMenu("settings")
-        elseif which == 4 then
-            showSleepTimerDialog()
-        elseif which == 5 then
-            showVolumeBoostToggle = (showVolumeBoostToggle == "on") and "off" or "on"
-            saveState()
-            showToast("Volume Boost visibility updated")
-            showAudioSettingsMenu()
-        elseif which == 6 then
-            showSleepTimerToggle = (showSleepTimerToggle == "on") and "off" or "on"
-            saveState()
-            showToast("Sleep Timer visibility updated")
-            showAudioSettingsMenu()
+                }))
+                
+                lvDur.setOnItemLongClickListener(AdapterView.OnItemLongClickListener({
+                    onItemLongClick = function(parent, view, position, id)
+                        local idx = position + 1
+                        if idx < #durItems then
+                            local targetDel = actionDurations[idx]
+                            durDialog.dismiss()
+                            local confDel = AlertDialog.Builder(service)
+                            confDel.setTitle("Delete Duration?")
+                            confDel.setMessage("Are you sure you want to delete " .. math.floor(targetDel / 1000) .. " seconds from list?")
+                            confDel.setPositiveButton("Delete", function()
+                                table.remove(_G.ffRwOptions, idx)
+                                showToast("Duration deleted.")
+                                showAudioSettingsMenu()
+                            end)
+                            confDel.setNegativeButton("Cancel", function() showAudioSettingsMenu() end)
+                            showDialogSafe(confDel, function() showAudioSettingsMenu() end)
+                        end
+                        return true
+                    end
+                }))
+                
+                Handler(Looper.getMainLooper()).post(Runnable({
+                    run = function()
+                        durDialog = durBuilder.create()
+                        durDialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+                        durDialog.show()
+                    end
+                }))
+                
+            elseif position == 1 then
+                if backgroundPlay == "on" then backgroundPlay = "off" cancelNotification() else backgroundPlay = "on" end
+                saveState()
+                showToast("Background playback " .. backgroundPlay)
+                refreshAudioSettings()
+            elseif position == 2 then
+                if autoPlay == "on" then autoPlay = "off" else autoPlay = "on" end
+                saveState()
+                showToast("Auto Play " .. autoPlay)
+                refreshAudioSettings()
+            elseif position == 3 then
+                audioDialog.dismiss()
+                showPlaybackSpeedMenu("settings")
+            elseif position == 4 then
+                audioDialog.dismiss()
+                showSleepTimerDialog()
+            elseif position == 5 then
+                showVolumeBoostToggle = (showVolumeBoostToggle == "on") and "off" or "on"
+                saveState()
+                showToast("Volume Boost visibility updated")
+                refreshAudioSettings()
+            elseif position == 6 then
+                showSleepTimerToggle = (showSleepTimerToggle == "on") and "off" or "on"
+                saveState()
+                showToast("Sleep Timer visibility updated")
+                refreshAudioSettings()
+            elseif position == 7 then
+                showFavoriteButtonToggle = (showFavoriteButtonToggle == "on") and "off" or "on"
+                saveState()
+                showToast("Favorite button visibility updated: " .. showFavoriteButtonToggle:upper())
+                refreshAudioSettings()
+            end
         end
-    end)
+    }))
     builder.setNegativeButton("Back", function() showSettingsMenu() end)
-    showDialogSafe(builder, function() showSettingsMenu() end)
+    
+    Handler(Looper.getMainLooper()).post(Runnable({
+        run = function()
+            audioDialog = builder.create()
+            audioDialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+            audioDialog.setOnKeyListener(DialogInterface.OnKeyListener({
+                onKey = function(d, keyCode, event)
+                    if keyCode == 4 then
+                        if event.getAction() == 1 then
+                            audioDialog.dismiss()
+                            showSettingsMenu()
+                        end
+                        return true
+                    end
+                    return false
+                end
+            }))
+            audioDialog.show()
+        end
+    }))
 end
 
 -- Playback Speed Menu
@@ -945,7 +1164,7 @@ showPlaybackSpeedMenu = function(parentMenu)
     showDialogSafe(speedBuilder, backFunc)
 end
 
--- Sleep Timer Dialog
+-- Sleep Timer Dialog with Duration announcement Fix
 showSleepTimerDialog = function()
     Handler(Looper.getMainLooper()).post(Runnable({
         run = function()
@@ -999,10 +1218,16 @@ showSleepTimerDialog = function()
                             end
                         })
                         sleepHandler.postDelayed(sleepRunnable, sleepDurationMs)
-                        showToast("Sleep mode activated successfully.")
+                        
+                        local durStr = ""
+                        if h > 0 then durStr = durStr .. h .. " Hours " end
+                        if m > 0 then durStr = durStr .. m .. " Minutes " end
+                        if s > 0 then durStr = durStr .. s .. " Seconds" end
+                        showToast("Sleep time turned on for: " .. durStr)
                     else
                         showToast("Invalid time duration entered.")
                     end
+                    showAudioSettingsMenu()
                 end
             }))
             builder.setNegativeButton("Cancel", DialogInterface.OnClickListener({
@@ -1015,9 +1240,11 @@ showSleepTimerDialog = function()
             import "android.view.KeyEvent"
             dialog.setOnKeyListener(DialogInterface.OnKeyListener({
                 onKey = function(d, keyCode, event)
-                    if keyCode == KeyEvent.KEYCODE_BACK and event.getAction() == KeyEvent.ACTION_UP then
-                        dialog.dismiss()
-                        showAudioSettingsMenu()
+                    if keyCode == KeyEvent.KEYCODE_BACK then
+                        if event.getAction() == KeyEvent.ACTION_UP then
+                            dialog.dismiss()
+                            showAudioSettingsMenu()
+                        end
                         return true
                     end
                     return false
@@ -1036,7 +1263,13 @@ showStorageMenu = function()
     builder.setItems(items, function(dialog, which)
         local selectedStorage = "/storage/emulated/0"
         if which == 1 then
-            selectedStorage = getExternalSdCardPath()
+            local sdPath = getExternalSdCardPath()
+            if not sdPath or sdPath == "/storage" then
+                showToast("No SD card inserted")
+                showStorageMenu()
+                return
+            end
+            selectedStorage = sdPath
         end
         showMediaTypeMenu(selectedStorage)
     end)
@@ -1057,13 +1290,15 @@ showMediaTypeMenu = function(storagePath)
     showDialogSafe(builder, function() showStorageMenu() end)
 end
 
--- 5. Selection Mode Menu
+-- 5. Selection Mode Menu (Favorites Added)
 showBrowseModeMenu = function(storagePath, mediaType)
-    local items = {"All Files", "Browse Folders"}
+    local items = {"Favorites", "All Files", "Browse Folders"}
     local builder = AlertDialog.Builder(service)
     builder.setTitle("Select Mode")
     builder.setItems(items, function(dialog, which)
         if which == 0 then
+            currentBrowseMode = "favorites"
+        elseif which == 1 then
             currentBrowseMode = "all_files"
         else
             currentBrowseMode = "folders"
@@ -1076,7 +1311,7 @@ showBrowseModeMenu = function(storagePath, mediaType)
     showDialogSafe(builder, function() showMediaTypeMenu(storagePath) end)
 end
 
--- 6. Unified Media List Engine with In-Place Update & Fixed Layout Width Actions
+-- 6. Unified Media List Engine (Optimized In-Place Multi-Select Layout Stability & Accessibility Toggle)
 renderMediaList = function(currentPath, mediaType)
     if currentPath == "/storage" then
         local autoSd = getExternalSdCardPath()
@@ -1090,7 +1325,23 @@ renderMediaList = function(currentPath, mediaType)
 
     local rawItems = {}
 
-    if currentBrowseMode == "all_files" then
+    if currentBrowseMode == "favorites" then
+        for path, _ in pairs(_G.smart_player_favorites) do
+            local fileObj = File(path)
+            if fileObj.exists() then
+                local name = fileObj.getName()
+                if matchesFormat(name, mediaType) then
+                    if path:sub(1, #currentPath) == currentPath then
+                        local time = 0
+                        pcall(function() time = fileObj.lastModified() end)
+                        local size = 0
+                        pcall(function() size = fileObj.length() end)
+                        table.insert(rawItems, {name = name, path = path, isDir = false, time = time, size = size})
+                    end
+                end
+            end
+        end
+    elseif currentBrowseMode == "all_files" then
         showToast("Scanning files, please wait...")
         rawItems = getAllRecursiveFiles(currentPath, mediaType)
     else
@@ -1178,13 +1429,12 @@ renderMediaList = function(currentPath, mediaType)
         end)
     end
 
-    if #filteredList == 0 and currentSearchQuery == "" then
+    if #filteredList == 0 and currentSearchQuery == "" and currentBrowseMode ~= "favorites" then
         showToast("No files found.")
         showMainMenu()
         return
     end
 
-    -- Create ArrayList for dynamic in-place updates (Fixes screen reader focus loss bug)
     local displayItems = luajava.newInstance("java.util.ArrayList")
     local actionItems = {}
 
@@ -1199,40 +1449,72 @@ renderMediaList = function(currentPath, mediaType)
     lvMedia.setLayoutParams(lvParams)
     mainLayout.addView(lvMedia)
 
-    local bottomBar = nil
-    local btnCancel = nil
-    local btnShare = nil
-    local btnDelete = nil
+    -- Fixed In-Place Pre-Built Bottom Bar layout structure to eliminate focus jumps
+    local bottomBar = LinearLayout(service)
+    bottomBar.setOrientation(LinearLayout.HORIZONTAL)
+    bottomBar.setGravity(Gravity.RIGHT)
+    local barParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+    bottomBar.setLayoutParams(barParams)
+
+    local wrapParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+    local weightParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+
+    local btnCancel = Button(service)
+    btnCancel.setText("Cancel")
+    btnCancel.setLayoutParams(wrapParams)
+
+    local btnShare = Button(service)
+    btnShare.setLayoutParams(weightParams)
+
+    local btnDelete = Button(service)
+    btnDelete.setLayoutParams(weightParams)
+
+    bottomBar.addView(btnCancel)
+    bottomBar.addView(btnShare)
+    bottomBar.addView(btnDelete)
+    mainLayout.addView(bottomBar)
+
     local mediaListDialog = nil
 
-    -- In-place updating function that keeps the screen reader focused correctly
     local function updateListAndButtons()
         displayItems.clear()
         actionItems = {}
 
-        local searchString = "Search"
-        if currentSearchQuery ~= "" then searchString = "Search: " .. currentSearchQuery end
-        displayItems.add(searchString)
-        table.insert(actionItems, {type = "control", target = "search"})
+        if currentBrowseMode ~= "favorites" then
+            local searchString = "Search"
+            if currentSearchQuery ~= "" then searchString = "Search: " .. currentSearchQuery end
+            displayItems.add(searchString)
+            table.insert(actionItems, {type = "control", target = "search"})
 
-        local sortMethodsTranslations = {["A-Z"] = "A-Z", ["Z-A"] = "Z-A", ["Newest"] = "Newest First", ["Oldest"] = "Oldest First"}
-        displayItems.add("Sort By: " .. (sortMethodsTranslations[currentSortMethod] or currentSortMethod))
-        table.insert(actionItems, {type = "control", target = "sort"})
+            local sortMethodsTranslations = {["A-Z"] = "A-Z", ["Z-A"] = "Z-A", ["Newest"] = "Newest First", ["Oldest"] = "Oldest First"}
+            displayItems.add("Sort By: " .. (sortMethodsTranslations[currentSortMethod] or currentSortMethod))
+            table.insert(actionItems, {type = "control", target = "sort"})
 
-        if currentSearchQuery ~= "" then
-            displayItems.add("Clear Search")
-            table.insert(actionItems, {type = "control", target = "clear_search"})
+            if currentSearchQuery ~= "" then
+                displayItems.add("Clear Search")
+                table.insert(actionItems, {type = "control", target = "clear_search"})
+            end
         end
 
         if isMultiSelectActive then
             displayItems.add("[Select All]")
             table.insert(actionItems, {type = "multiselect_control", target = "select_all"})
+            bottomBar.setVisibility(View.VISIBLE)
+        else
+            bottomBar.setVisibility(View.GONE)
         end
 
         for _, item in ipairs(filteredList) do
             local prefix = ""
+            local suffix = ""
             if isMultiSelectActive then
-                if selectedItemsMap[item.path] then prefix = "[✓] " else prefix = "[ ] " end
+                if selectedItemsMap[item.path] then 
+                    prefix = "[✓] " 
+                    suffix = " - Check Box Checked" 
+                else 
+                    prefix = "[ ] " 
+                    suffix = " - Check Box Not Checked" 
+                end
             else
                 if not item.isDir then
                     if mediaType == "video" or (mediaType == "statuses" and item.name:lower():find("%.mp4$")) then
@@ -1244,22 +1526,21 @@ renderMediaList = function(currentPath, mediaType)
             end
             
             if item.isDir then
-                displayItems.add(prefix .. "[Folder] " .. item.name)
+                displayItems.add(prefix .. "[Folder] " .. item.name .. suffix)
                 table.insert(actionItems, {type = "media", data = item})
             else
-                displayItems.add(prefix .. item.name)
+                displayItems.add(prefix .. item.name .. suffix)
                 table.insert(actionItems, {type = "media", data = item})
             end
         end
 
         adapterMedia.notifyDataSetChanged()
 
-        if isMultiSelectActive and btnShare and btnDelete then
+        if isMultiSelectActive then
             local selCount, selSizeStr = getSelectedStats(filteredList, selectedItemsMap)
-            btnShare.setText(string.format("Share (%d items, %s)", selCount, selSizeStr))
-            btnDelete.setText(string.format("Delete (%d items, %s)", selCount, selSizeStr))
+            btnShare.setText(string.format("Share (%d, %s)", selCount, selSizeStr))
+            btnDelete.setText(string.format("Delete (%d, %s)", selCount, selSizeStr))
             
-            -- Dynamic Visibility Check: Hide share button if any folder is selected
             local hasFolderSelected = false
             for _, item in ipairs(filteredList) do
                 if selectedItemsMap[item.path] and item.isDir then
@@ -1273,214 +1554,201 @@ renderMediaList = function(currentPath, mediaType)
                 btnShare.setVisibility(View.VISIBLE)
             end
         end
+
+        -- Dynamically update negative button text based on multi-select state
+        if mediaListDialog then
+            local negBtn = mediaListDialog.getButton(DialogInterface.BUTTON_NEGATIVE)
+            if negBtn then
+                if isMultiSelectActive then
+                    negBtn.setText("Clear Selection")
+                else
+                    negBtn.setText("Back")
+                end
+            end
+        end
     end
 
-    -- Setup Bottom Actions row layout for multi-select (Fixed Width to avoid pushing Delete off-screen)
-    if isMultiSelectActive then
-        bottomBar = LinearLayout(service)
-        bottomBar.setOrientation(LinearLayout.HORIZONTAL)
-        bottomBar.setGravity(Gravity.RIGHT)
-        local barParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        bottomBar.setLayoutParams(barParams)
+    btnCancel.setOnClickListener(View.OnClickListener({
+        onClick = function(v)
+            isMultiSelectActive = false
+            selectedItemsMap = {}
+            showToast("Clear Selection")
+            updateListAndButtons()
+        end
+    }))
 
-        local wrapParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        local weightParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
-
-        btnCancel = Button(service)
-        btnCancel.setText("Cancel")
-        btnCancel.setLayoutParams(wrapParams)
-        btnCancel.setOnClickListener(View.OnClickListener({
-            onClick = function(v)
-                isMultiSelectActive = false
-                selectedItemsMap = {}
-                mediaListDialog.dismiss()
-                renderMediaList(currentPath, mediaType)
+    btnShare.setOnClickListener(View.OnClickListener({
+        onClick = function(v)
+            local sharePaths = {}
+            for _, item in ipairs(filteredList) do
+                if not item.isDir and selectedItemsMap[item.path] then
+                    table.insert(sharePaths, item.path)
+                end
             end
-        }))
+            if #sharePaths == 0 then
+                showToast("No files selected to share.")
+                return
+            end
+            saveState()
+            if mediaListDialog then mediaListDialog.dismiss() end
+            _G.currentMediaListDialog = nil
+            
+            local originalPackage = ""
+            pcall(function()
+                local root = service.getRootInActiveWindow()
+                if root then originalPackage = tostring(root.getPackageName()) end
+            end)
+            if originalPackage == "" or originalPackage == "android" or originalPackage == "com.android.intentresolver" then
+                originalPackage = "com.android.launcher3"
+            end
 
-        btnShare = Button(service)
-        btnShare.setLayoutParams(weightParams)
-        btnShare.setOnClickListener(View.OnClickListener({
-            onClick = function(v)
-                local sharePaths = {}
-                for _, item in ipairs(filteredList) do
-                    if not item.isDir and selectedItemsMap[item.path] then
-                        table.insert(sharePaths, item.path)
+            pcall(function()
+                local context = service
+                setStrictModeAllowFileUri()
+                if #sharePaths == 1 then
+                    local file = File(sharePaths[1])
+                    local shareUri = Uri.fromFile(file)
+                    local intent = Intent(Intent.ACTION_SEND)
+                    intent.setType("*/*")
+                    intent.putExtra(Intent.EXTRA_STREAM, shareUri)
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    local chooser = Intent.createChooser(intent, "Share File")
+                    chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(chooser)
+                else
+                    local uris = luajava.newInstance("java.util.ArrayList")
+                    for _, path in ipairs(sharePaths) do
+                        uris.add(Uri.fromFile(File(path)))
+                    end
+                    local intent = Intent(Intent.ACTION_SEND_MULTIPLE)
+                    intent.setType("*/*")
+                    intent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    local chooser = Intent.createChooser(intent, "Share Files")
+                    chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(chooser)
+                end
+            end)
+            
+            local monitorHandler = Handler(Looper.getMainLooper())
+            local monitorRunnable
+            local loopCount = 0
+            local hasLeftApp = false
+            
+            monitorRunnable = Runnable({
+                run = function()
+                    loopCount = loopCount + 1
+                    local currentPkg = ""
+                    pcall(function()
+                        local root = service.getRootInActiveWindow()
+                        if root then currentPkg = tostring(root.getPackageName()) end
+                    end)
+                    local currentPkgLower = currentPkg:lower()
+                    
+                    if currentPkg ~= "" and currentPkg ~= originalPackage and not currentPkgLower:find("launcher") and not currentPkgLower:find("home") then
+                        hasLeftApp = true
+                    end
+                    
+                    if hasLeftApp and (currentPkg == originalPackage or currentPkgLower:find("launcher") or currentPkgLower:find("home")) then
+                        Handler(Looper.getMainLooper()).post(Runnable({
+                            run = function() 
+                                if currentFilePath and currentFilePath ~= "" then
+                                    showPlayerControls()
+                                else
+                                    renderMediaList(currentPath, mediaType)
+                                end
+                            end
+                        }))
+                    elseif not hasLeftApp and loopCount > 10 then
+                        Handler(Looper.getMainLooper()).post(Runnable({
+                            run = function()
+                                if currentFilePath and currentFilePath ~= "" then
+                                    showPlayerControls()
+                                else
+                                    renderMediaList(currentPath, mediaType)
+                                end
+                            end
+                        }))
+                    elseif loopCount < 120 then
+                        monitorHandler.postDelayed(monitorRunnable, 1000)
                     end
                 end
-                if #sharePaths == 0 then
-                    showToast("No files selected to share. Folders cannot be shared directly.")
-                    return
-                end
-                saveState()
-                mediaListDialog.dismiss()
-                
-                -- Detect current package for return app monitor loop
-                local originalPackage = ""
-                pcall(function()
-                    local root = service.getRootInActiveWindow()
-                    if root then originalPackage = tostring(root.getPackageName()) end
-                end)
-                if originalPackage == "" or originalPackage == "android" or originalPackage == "com.android.intentresolver" then
-                    originalPackage = "com.android.launcher3"
-                end
-                
-                pcall(function()
-                    local context = service
-                    setStrictModeAllowFileUri()
-                    if #sharePaths == 1 then
-                        local file = File(sharePaths[1])
-                        local shareUri = Uri.fromFile(file)
-                        local intent = Intent(Intent.ACTION_SEND)
-                        intent.setType("*/*")
-                        intent.putExtra(Intent.EXTRA_STREAM, shareUri)
-                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        local chooser = Intent.createChooser(intent, "Share File")
-                        chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        context.startActivity(chooser)
-                    else
-                        local uris = luajava.newInstance("java.util.ArrayList")
-                        for _, path in ipairs(sharePaths) do
-                            uris.add(Uri.fromFile(File(path)))
-                        end
-                        local intent = Intent(Intent.ACTION_SEND_MULTIPLE)
-                        intent.setType("*/*")
-                        intent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
-                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        local chooser = Intent.createChooser(intent, "Share Files")
-                        chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        context.startActivity(chooser)
-                    end
-                end)
-                
-                -- App Monitor Loop for Multiple Sharing safely without changing original logic
-                local monitorHandler = Handler(Looper.getMainLooper())
-                local monitorRunnable
-                local loopCount = 0
-                local hasLeftApp = false
-                
-                monitorRunnable = Runnable({
-                    run = function()
-                        loopCount = loopCount + 1
-                        local currentPkg = ""
-                        pcall(function()
-                            local root = service.getRootInActiveWindow()
-                            if root then currentPkg = tostring(root.getPackageName()) end
-                        end)
-                        local currentPkgLower = currentPkg:lower()
-                        
-                        if currentPkg ~= "" and currentPkg ~= originalPackage and not currentPkgLower:find("launcher") and not currentPkgLower:find("home") then
-                            hasLeftApp = true
-                        end
-                        
-                        if hasLeftApp and (currentPkg == originalPackage or currentPkgLower:find("launcher") or currentPkgLower:find("home")) then
-                            Handler(Looper.getMainLooper()).post(Runnable({
-                                run = function() 
-                                    if currentFilePath and currentFilePath ~= "" then
-                                        showPlayerControls()
+            })
+            monitorHandler.postDelayed(monitorRunnable, 1000)
+            
+            isMultiSelectActive = false
+            selectedItemsMap = {}
+        end
+    }))
+
+    btnDelete.setOnClickListener(View.OnClickListener({
+        onClick = function(v)
+            local selCount, selSizeStr = getSelectedStats(filteredList, selectedItemsMap)
+            if selCount == 0 then
+                showToast("No items selected.")
+            else
+                local confSelDel = AlertDialog.Builder(service)
+                confSelDel.setTitle("Confirm Deletion")
+                confSelDel.setMessage(string.format("Are you sure you want to permanently delete %d selected items (%s)?", selCount, selSizeStr))
+                confSelDel.setPositiveButton("Delete All", function()
+                    showToast("Deleting selected items...")
+                    
+                    Thread(Runnable({
+                        run = function()
+                            local resetPlayer = false
+                            for _, item in ipairs(filteredList) do
+                                if selectedItemsMap[item.path] and currentFilePath == item.path then
+                                    resetPlayer = true
+                                end
+                            end
+                            if resetPlayer then
+                                Handler(Looper.getMainLooper()).post(Runnable({
+                                    run = function() player.reset() cancelNotification() end
+                                }))
+                                _G.smart_player_is_prepared = false
+                                _G.smart_player_current_path = ""
+                                currentFilePath = "" lastPlayedPosition = 0
+                            end
+
+                            local successCount = 0
+                            for _, item in ipairs(filteredList) do
+                                if selectedItemsMap[item.path] then
+                                    local targetFile = File(item.path)
+                                    if item.isDir then
+                                        if deleteFolderRecursive(targetFile) then successCount = successCount + 1 end
                                     else
-                                        renderMediaList(currentPath, mediaType)
+                                        if targetFile.delete() then successCount = successCount + 1 end
                                     end
                                 end
-                            }))
-                        elseif not hasLeftApp and loopCount > 10 then
+                            end
+                            
                             Handler(Looper.getMainLooper()).post(Runnable({
                                 run = function()
-                                    if currentFilePath and currentFilePath ~= "" then
-                                        showPlayerControls()
-                                    else
-                                        renderMediaList(currentPath, mediaType)
-                                    end
+                                    showToast(successCount .. " items deleted successfully.")
+                                    isMultiSelectActive = false
+                                    selectedItemsMap = {}
+                                    saveState()
+                                    if mediaListDialog then pcall(function() mediaListDialog.dismiss() end) end
+                                    _G.currentMediaListDialog = nil
+                                    if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
+                                    renderMediaList(currentPath, mediaType)
                                 end
                             }))
-                        elseif loopCount < 120 then
-                            monitorHandler.postDelayed(monitorRunnable, 1000)
                         end
-                    end
-                })
-                monitorHandler.postDelayed(monitorRunnable, 1000)
-                
-                isMultiSelectActive = false
-                selectedItemsMap = {}
+                    })).start()
+                end)
+                confSelDel.setNegativeButton("Cancel", nil)
+                showDialogSafe(confSelDel)
             end
-        }))
-
-        btnDelete = Button(service)
-        btnDelete.setLayoutParams(weightParams)
-        btnDelete.setOnClickListener(View.OnClickListener({
-            onClick = function(v)
-                local selCount, selSizeStr = getSelectedStats(filteredList, selectedItemsMap)
-                if selCount == 0 then
-                    showToast("No items selected.")
-                else
-                    local confSelDel = AlertDialog.Builder(service)
-                    confSelDel.setTitle("Confirm Deletion")
-                    confSelDel.setMessage(string.format("Are you sure you want to permanently delete %d selected items (%s)?", selCount, selSizeStr))
-                    confSelDel.setPositiveButton("Delete All", function()
-                        mediaListDialog.dismiss()
-                        showToast("Deleting selected items...")
-                        
-                        -- Non-blocking Thread Execution to avoid phone hang
-                        Thread(Runnable({
-                            run = function()
-                                local resetPlayer = false
-                                for _, item in ipairs(filteredList) do
-                                    if selectedItemsMap[item.path] and currentFilePath == item.path then
-                                        resetPlayer = true
-                                    end
-                                end
-                                if resetPlayer then
-                                    Handler(Looper.getMainLooper()).post(Runnable({
-                                        run = function() player.reset() cancelNotification() end
-                                    }))
-                                    _G.smart_player_is_prepared = false
-                                    _G.smart_player_current_path = ""
-                                    currentFilePath = "" lastPlayedPosition = 0
-                                end
-
-                                local successCount = 0
-                                for _, item in ipairs(filteredList) do
-                                    if selectedItemsMap[item.path] then
-                                        local targetFile = File(item.path)
-                                        if item.isDir then
-                                            if deleteFolderRecursive(targetFile) then successCount = successCount + 1 end
-                                        else
-                                            if targetFile.delete() then successCount = successCount + 1 end
-                                        end
-                                    end
-                                end
-                                
-                                Handler(Looper.getMainLooper()).post(Runnable({
-                                    run = function()
-                                        showToast(successCount .. " items deleted successfully.")
-                                        isMultiSelectActive = false
-                                        selectedItemsMap = {}
-                                        saveState()
-                                        if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
-                                        renderMediaList(currentPath, mediaType)
-                                    end
-                                }))
-                            end
-                        })).start()
-                    end)
-                    confSelDel.setNegativeButton("Cancel", nil)
-                    showDialogSafe(confSelDel, function() end)
-                end
-            end
-        }))
-
-        bottomBar.addView(btnCancel)
-        bottomBar.addView(btnShare)
-        bottomBar.addView(btnDelete)
-        mainLayout.addView(bottomBar)
-    end
+        end
+    }))
 
     updateListAndButtons()
 
     local builder = AlertDialog.Builder(service)
-    builder.setTitle(currentBrowseMode == "all_files" and "All Files" or "Browse Folders")
+    builder.setTitle(currentBrowseMode == "all_files" and "All Files" or (currentBrowseMode == "favorites" and "Favorites" or "Browse Folders"))
     builder.setView(mainLayout)
 
     lvMedia.setOnItemClickListener(AdapterView.OnItemClickListener({
@@ -1490,7 +1758,6 @@ renderMediaList = function(currentPath, mediaType)
             
             if action.type == "control" then
                 if action.target == "search" then
-                    mediaListDialog.dismiss()
                     Handler(Looper.getMainLooper()).post(Runnable({
                         run = function()
                             local inputField = EditText(service)
@@ -1501,16 +1768,21 @@ renderMediaList = function(currentPath, mediaType)
                             searchDialog.setView(inputField)
                             searchDialog.setPositiveButton("Search", function()
                                 currentSearchQuery = tostring(inputField.getText())
+                                if mediaListDialog then mediaListDialog.dismiss() end
+                                _G.currentMediaListDialog = nil
                                 renderMediaList(currentPath, mediaType)
                             end)
                             searchDialog.setNegativeButton("Cancel", function()
+                                if mediaListDialog then mediaListDialog.dismiss() end
+                                _G.currentMediaListDialog = nil
                                 renderMediaList(currentPath, mediaType)
                             end)
-                            showDialogSafe(searchDialog, function() renderMediaList(currentPath, mediaType) end)
+                            local dlg = searchDialog.create()
+                            dlg.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+                            dlg.show()
                         end
                     }))
                 elseif action.target == "sort" then
-                    mediaListDialog.dismiss()
                     local sortOptions = {"A-Z", "Z-A", "Newest First", "Oldest First"}
                     local sortOptionBuilder = AlertDialog.Builder(service)
                     sortOptionBuilder.setTitle("Sort By")
@@ -1520,12 +1792,15 @@ renderMediaList = function(currentPath, mediaType)
                         elseif w == 2 then currentSortMethod = "Newest"
                         elseif w == 3 then currentSortMethod = "Oldest" end
                         saveState()
+                        if mediaListDialog then mediaListDialog.dismiss() end
+                        _G.currentMediaListDialog = nil
                         renderMediaList(currentPath, mediaType)
                     end)
-                    showDialogSafe(sortOptionBuilder, function() renderMediaList(currentPath, mediaType) end)
+                    local dlg = sortOptionBuilder.create()
+                    dlg.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+                    dlg.show()
                 elseif action.target == "clear_search" then
                     currentSearchQuery = ""
-                    mediaListDialog.dismiss()
                     renderMediaList(currentPath, mediaType)
                 end
             elseif action.type == "multiselect_control" then
@@ -1540,35 +1815,38 @@ renderMediaList = function(currentPath, mediaType)
                 if isMultiSelectActive then
                     selectedItemsMap[selectedMedia.path] = not selectedItemsMap[selectedMedia.path]
                     if selectedItemsMap[selectedMedia.path] then
-                        service.speak("Checked")
+                        service.speak("Check Box Checked")
                     else
-                        service.speak("Not checked")
+                        service.speak("Check Box Not Checked")
                     end
                     updateListAndButtons() 
                 else
                     if selectedMedia.isDir then
-                        mediaListDialog.dismiss()
                         renderMediaList(selectedMedia.path, mediaType)
                     else
                         if mediaType == "statuses" and not selectedMedia.path:lower():find("%.mp4$") then
                             openImageExternally(selectedMedia.path)
                         else
-                            mediaListDialog.dismiss()
-                            currentPlaylist = {}
+                            _G.smart_media_player_playlist = {}
+                            local pathCheck = {}
                             for _, innerObj in ipairs(filteredList) do
                                 if not innerObj.isDir then
-                                    if mediaType == "statuses" then
-                                        if innerObj.path:lower():find("%.mp4$") then
-                                            table.insert(currentPlaylist, innerObj.path)
-                                            if innerObj.path == selectedMedia.path then currentIndex = #currentPlaylist end
+                                    if not pathCheck[innerObj.path] then
+                                        pathCheck[innerObj.path] = true
+                                        if mediaType == "statuses" then
+                                            if innerObj.path:lower():find("%.mp4$") then
+                                                table.insert(_G.smart_media_player_playlist, innerObj.path)
+                                                if innerObj.path == selectedMedia.path then _G.smart_player_index = #_G.smart_media_player_playlist end
+                                            end
+                                        else
+                                            table.insert(_G.smart_media_player_playlist, innerObj.path)
+                                            if innerObj.path == selectedMedia.path then _G.smart_player_index = #_G.smart_media_player_playlist end
                                         end
-                                    else
-                                        table.insert(currentPlaylist, innerObj.path)
-                                        if innerObj.path == selectedMedia.path then currentIndex = #currentPlaylist end
                                     end
                                 end
                             end
                             lastPlayedPosition = 0
+                            saveState()
                             playMedia(selectedMedia.path, true)
                         end
                     end
@@ -1582,19 +1860,35 @@ renderMediaList = function(currentPath, mediaType)
             local action = actionItems[position + 1]
             if action and action.type == "media" then
                 local targetMedia = action.data
+                if currentBrowseMode == "favorites" then
+                    local confFavRem = AlertDialog.Builder(service)
+                    confFavRem.setTitle("Remove Favorite")
+                    confFavRem.setMessage("Are you sure you want to remove this file from favorites?")
+                    confFavRem.setPositiveButton("Remove", function()
+                        _G.smart_player_favorites[targetMedia.path] = nil
+                        saveFavorites()
+                        showToast("Removed from favorites.")
+                        if mediaListDialog then mediaListDialog.dismiss() end
+                        _G.currentMediaListDialog = nil
+                        renderMediaList(currentPath, mediaType)
+                    end)
+                    confFavRem.setNegativeButton("Cancel", nil)
+                    showDialogSafe(confFavRem)
+                    return true
+                end
+
                 if multiSelectSetting == "on" then
                     if not isMultiSelectActive then
                         isMultiSelectActive = true
                         selectedItemsMap = {}
                         selectedItemsMap[targetMedia.path] = true
+                        service.speak("Check Box Checked")
                         showToast("Multi-select mode enabled.")
-                        mediaListDialog.dismiss()
-                        renderMediaList(currentPath, mediaType)
+                        updateListAndButtons()
                     end
                 else
                     local confSingleDel = AlertDialog.Builder(service)
                     confSingleDel.setTitle("Delete Item?")
-                    
                     local msg = "Are you sure you want to permanently delete: " .. targetMedia.name .. "?"
                     if targetMedia.isDir then
                         local totalSize = getFolderSizeRecursive(File(targetMedia.path))
@@ -1602,7 +1896,6 @@ renderMediaList = function(currentPath, mediaType)
                         msg = "Do you want to delete this folder: " .. targetMedia.name .. " (" .. sizeStr .. ")?"
                     end
                     confSingleDel.setMessage(msg)
-                    
                     confSingleDel.setPositiveButton("Delete", function()
                         showToast("Deleting...")
                         Thread(Runnable({
@@ -1614,7 +1907,6 @@ renderMediaList = function(currentPath, mediaType)
                                 else
                                     deleted = targetFile.delete()
                                 end
-                                
                                 Handler(Looper.getMainLooper()).post(Runnable({
                                     run = function()
                                         if deleted then
@@ -1624,7 +1916,8 @@ renderMediaList = function(currentPath, mediaType)
                                                 currentFilePath = "" lastPlayedPosition = 0 saveState()
                                                 if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
                                             end
-                                            mediaListDialog.dismiss()
+                                            if mediaListDialog then pcall(function() mediaListDialog.dismiss() end) end
+                                            _G.currentMediaListDialog = nil
                                             renderMediaList(currentPath, mediaType)
                                         else
                                             showToast("Failed to delete.")
@@ -1646,11 +1939,9 @@ renderMediaList = function(currentPath, mediaType)
         if isMultiSelectActive then
             isMultiSelectActive = false
             selectedItemsMap = {}
-            mediaListDialog.dismiss()
-            renderMediaList(currentPath, mediaType)
+            showToast("Clear Selection")
+            updateListAndButtons()
         else
-            mediaListDialog.dismiss()
-            
             local pathStr = tostring(currentPath)
             if pathStr:find("WhatsApp/Media") then
                 local name = File(currentPath).getName()
@@ -1660,7 +1951,7 @@ renderMediaList = function(currentPath, mediaType)
                 end
             end
             
-            if currentBrowseMode == "all_files" then
+            if currentBrowseMode == "all_files" or currentBrowseMode == "favorites" then
                 local baseStorage = "/storage/emulated/0"
                 local sdPath = getExternalSdCardPath()
                 if sdPath and pathStr:sub(1, #sdPath) == sdPath then baseStorage = sdPath end
@@ -1685,23 +1976,40 @@ renderMediaList = function(currentPath, mediaType)
         end
     end
     
-    builder.setNegativeButton("Back", backFunc)
+    builder.setNegativeButton("Back", nil)
     
     Handler(Looper.getMainLooper()).post(Runnable({
         run = function()
+            local oldDlg = _G.currentMediaListDialog
             mediaListDialog = builder.create()
+            _G.currentMediaListDialog = mediaListDialog
             mediaListDialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
             import "android.view.KeyEvent"
             mediaListDialog.setOnKeyListener(DialogInterface.OnKeyListener({
                 onKey = function(d, keyCode, event)
-                    if keyCode == KeyEvent.KEYCODE_BACK and event.getAction() == KeyEvent.ACTION_UP then
-                        backFunc()
+                    if keyCode == KeyEvent.KEYCODE_BACK then
+                        if event.getAction() == KeyEvent.ACTION_UP then
+                            backFunc()
+                        end
                         return true
                     end
                     return false
                 end
             }))
             mediaListDialog.show()
+            
+            -- Override the negative button click to prevent automatic dismissal when multi-select is active
+            local negBtn = mediaListDialog.getButton(DialogInterface.BUTTON_NEGATIVE)
+            if negBtn then
+                negBtn.setOnClickListener(View.OnClickListener({
+                    onClick = function(v)
+                        backFunc()
+                    end
+                }))
+            end
+
+            if oldDlg and oldDlg ~= mediaListDialog then pcall(function() oldDlg.dismiss() end) end
+            updateListAndButtons()
         end
     }))
 end
@@ -1729,11 +2037,17 @@ playMedia = function(filePath, forcePlay)
         
         player.setOnCompletionListener(MediaPlayer.OnCompletionListener({
             onCompletion = function(mp)
+                mp.setOnCompletionListener(nil) -- Decouple listener state to fully fix skipping jumps
                 if autoPlay == "on" then
-                    if currentIndex < #currentPlaylist then
-                        currentIndex = currentIndex + 1
+                    if _G.smart_player_index < #_G.smart_media_player_playlist then
+                        _G.smart_player_index = _G.smart_player_index + 1
                         lastPlayedPosition = 0
-                        playMedia(currentPlaylist[currentIndex], true)
+                        saveState()
+                        Handler(Looper.getMainLooper()).post(Runnable({
+                            run = function()
+                                playMedia(_G.smart_media_player_playlist[_G.smart_player_index], true)
+                            end
+                        }))
                     else
                         cancelNotification()
                         if btnPlayPauseRef then btnPlayPauseRef.setText("Play") end
@@ -1746,7 +2060,6 @@ playMedia = function(filePath, forcePlay)
         }))
         
         if lastPlayedPosition > 0 then player.seekTo(lastPlayedPosition) end
-        
         if shouldStart then
             player.start()
             applyPlaybackSpeed()
@@ -1861,7 +2174,16 @@ showPlayerControls = function()
                                     end
                                 })
                                 sleepHandler.postDelayed(sleepRunnable, sleepDurationMs)
-                                showToast("Sleep Mode ON")
+                                
+                                local totalSecs = math.floor(sleepDurationMs / 1000)
+                                local h = math.floor(totalSecs / 3600)
+                                local m = math.floor((totalSecs % 3600) / 60)
+                                local s = totalSecs % 60
+                                local durStr = ""
+                                if h > 0 then durStr = durStr .. h .. " Hours " end
+                                if m > 0 then durStr = durStr .. m .. " Minutes " end
+                                if s > 0 then durStr = durStr .. s .. " Seconds" end
+                                showToast("Sleep time turned on for: " .. durStr)
                             else
                                 showToast("Sleep Mode ON")
                             end
@@ -1895,21 +2217,32 @@ showPlayerControls = function()
             spacer.setPadding(0, 0, 0, 20)
             layout.addView(spacer)
 
+            -- --- YouTube Style Row Player Controls Layout Engine ---
+            local rowControls = LinearLayout(context)
+            rowControls.setOrientation(LinearLayout.HORIZONTAL)
+            rowControls.setGravity(Gravity.CENTER)
+            local rowControlsParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            rowControls.setLayoutParams(rowControlsParams)
+
+            local btnParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+
             local btnPrev = Button(context)
             btnPrev.setText("Previous")
+            btnPrev.setLayoutParams(btnParams)
             btnPrev.setOnClickListener(View.OnClickListener({
                 onClick = function(v)
-                    if currentIndex > 1 then
-                        currentIndex = currentIndex - 1
+                    if _G.smart_player_index > 1 then
+                        _G.smart_player_index = _G.smart_player_index - 1
                         lastPlayedPosition = 0
-                        playMedia(currentPlaylist[currentIndex])
+                        saveState()
+                        playMedia(_G.smart_media_player_playlist[_G.smart_player_index], true)
                     else showToast("First file.") end
                 end
             }))
-            layout.addView(btnPrev)
 
             local btnRewind = Button(context)
-            btnRewind.setText("Rewind <<")
+            btnRewind.setText("Rewind")
+            btnRewind.setLayoutParams(btnParams)
             btnRewind.setOnClickListener(View.OnClickListener({
                 onClick = function(v)
                     local currentPos = player.getCurrentPosition()
@@ -1919,14 +2252,13 @@ showPlayerControls = function()
                     saveState()
                 end
             }))
-            layout.addView(btnRewind)
 
             local btnPlayPause = Button(context)
             btnPlayPauseRef = btnPlayPause
             local isPlaying = false
             pcall(function() isPlaying = player.isPlaying() end)
             btnPlayPause.setText(isPlaying and "Pause" or "Play")
-            
+            btnPlayPause.setLayoutParams(btnParams)
             btnPlayPause.setOnClickListener(View.OnClickListener({
                 onClick = function(v)
                     if player and player.isPlaying() then
@@ -1942,10 +2274,10 @@ showPlayerControls = function()
                     end
                 end
             }))
-            layout.addView(btnPlayPause)
 
             local btnFF = Button(context)
-            btnFF.setText("Fast Forward >>")
+            btnFF.setText("Fast forward")
+            btnFF.setLayoutParams(btnParams)
             btnFF.setOnClickListener(View.OnClickListener({
                 onClick = function(v)
                     local currentPos = player.getCurrentPosition()
@@ -1956,20 +2288,31 @@ showPlayerControls = function()
                     saveState()
                 end
             }))
-            layout.addView(btnFF)
 
             local btnNext = Button(context)
             btnNext.setText("Next")
+            btnNext.setLayoutParams(btnParams)
             btnNext.setOnClickListener(View.OnClickListener({
                 onClick = function(v)
-                    if currentIndex < #currentPlaylist then
-                        currentIndex = currentIndex + 1
+                    if _G.smart_player_index < #_G.smart_media_player_playlist then
+                        _G.smart_player_index = _G.smart_player_index + 1
                         lastPlayedPosition = 0
-                        playMedia(currentPlaylist[currentIndex])
+                        saveState()
+                        playMedia(_G.smart_media_player_playlist[_G.smart_player_index], true)
                     else showToast("Last file.") end
                 end
             }))
-            layout.addView(btnNext)
+
+            rowControls.addView(btnPrev)
+            rowControls.addView(btnRewind)
+            rowControls.addView(btnPlayPause)
+            rowControls.addView(btnFF)
+            rowControls.addView(btnNext)
+            layout.addView(rowControls)
+
+            local spacerBottom = TextView(context)
+            spacerBottom.setPadding(0, 0, 0, 10)
+            layout.addView(spacerBottom)
 
             local btnMore = Button(context)
             btnMore.setText("More Options")
@@ -1998,16 +2341,13 @@ showPlayerControls = function()
                     saveState()
                     if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
                     _G.smart_player_minimized = true
-                    if backgroundPlay == "on" then
+                    if backgroundPlay == "on" and player.isPlaying() then
                         showNotification(File(currentFilePath).getName())
-                    else
-                        pcall(function() 
-                            if player.isPlaying() then player.pause() end 
-                            lastPlayedPosition = player.getCurrentPosition() 
-                        end)
-                        _G.smart_player_is_prepared = true
-                        saveState() cancelNotification()
+                    elseif backgroundPlay == "off" and player.isPlaying() then
+                        player.pause()
+                        if btnPlayPauseRef then btnPlayPauseRef.setText("Play") end
                     end
+                    showToast("Player Minimized")
                 end
             }))
             layout.addView(btnMinimize)
@@ -2035,264 +2375,137 @@ showPlayerControls = function()
             builder.setView(scrollView)
             controlsDialog = builder.create()
             controlsDialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+            controlsDialog.show()
             
-            if currentSavedMediaType == "video" or currentSavedMediaType == "statuses" then
-                controlsDialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            -- Smooth transition logic to completely avoid home screen kick gaps
+            if _G.currentMediaListDialog then
+                pcall(function() _G.currentMediaListDialog.dismiss() end)
+                _G.currentMediaListDialog = nil
             end
             
-            import "android.view.KeyEvent"
-            controlsDialog.setOnKeyListener(DialogInterface.OnKeyListener({
-                onKey = function(dialog, keyCode, event)
-                    if keyCode == KeyEvent.KEYCODE_BACK and event.getAction() == KeyEvent.ACTION_UP then
-                        controlsDialog.dismiss()
-                        controlsDialog = nil
-                        saveState()
-                        
-                        if currentSavedFolder and currentSavedFolder ~= "" then
-                            isMultiSelectActive = false
-                            selectedItemsMap = {}
-                            renderMediaList(currentSavedFolder, currentSavedMediaType)
-                        else
-                            _G.smart_player_minimized = true
-                            if backgroundPlay == "on" then
-                                showNotification(File(currentFilePath).getName())
-                            else
-                                pcall(function() 
-                                    if player.isPlaying() then player.pause() end 
-                                    lastPlayedPosition = player.getCurrentPosition() 
-                                end)
-                                _G.smart_player_is_prepared = true
-                                saveState() cancelNotification()
-                            end
+            startSeekBarUpdate()
+        end
+    }))
+end
+
+-- 9. More Options Window (In-Place Focus Stability & Favorites Toggle Integration)
+showMoreOptions = function()
+    local displayItems = luajava.newInstance("java.util.ArrayList")
+    local lv = ListView(service)
+    local adapter = ArrayAdapter(service, android.R.layout.simple_list_item_1, displayItems)
+    lv.setAdapter(adapter)
+
+    local function refreshMoreOptionsList()
+        displayItems.clear()
+        displayItems.add("Playback Speed: " .. currentPlaybackSpeed .. "x")
+        displayItems.add("Sleep Timer Mode")
+        if showFavoriteButtonToggle == "on" then
+            local isFav = _G.smart_player_favorites[currentFilePath] and "Active" or "Inactive"
+            displayItems.add("Favorite Button: " .. isFav)
+        end
+        if currentSavedMediaType == "statuses" then
+            displayItems.add("Save Status to Gallery")
+        end
+        adapter.notifyDataSetChanged()
+    end
+    refreshMoreOptionsList()
+
+    local builder = AlertDialog.Builder(service)
+    builder.setTitle("More Options")
+    builder.setView(lv)
+    local moreDialog = nil
+
+    lv.setOnItemClickListener(AdapterView.OnItemClickListener({
+        onItemClick = function(parent, view, position, id)
+            if position == 0 then
+                moreDialog.dismiss()
+                showPlaybackSpeedMenu("player")
+            elseif position == 1 then
+                moreDialog.dismiss()
+                showSleepTimerDialog()
+            elseif position == 2 and showFavoriteButtonToggle == "on" then
+                if _G.smart_player_favorites[currentFilePath] then
+                    _G.smart_player_favorites[currentFilePath] = nil
+                    showToast("Removed from favorites.")
+                else
+                    _G.smart_player_favorites[currentFilePath] = true
+                    showToast("Added to favorites.")
+                end
+                saveFavorites()
+                refreshMoreOptionsList()
+            elseif (position == 2 and showFavoriteButtonToggle == "off" and currentSavedMediaType == "statuses") or 
+                   (position == 3 and showFavoriteButtonToggle == "on" and currentSavedMediaType == "statuses") then
+                saveStatusToGallery(currentFilePath)
+            end
+        end
+    }))
+    builder.setNegativeButton("Back", function() showPlayerControls() end)
+    
+    Handler(Looper.getMainLooper()).post(Runnable({
+        run = function()
+            moreDialog = builder.create()
+            moreDialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+            moreDialog.setOnKeyListener(DialogInterface.OnKeyListener({
+                onKey = function(d, keyCode, event)
+                    if keyCode == 4 then
+                        if event.getAction() == 1 then
+                            moreDialog.dismiss()
+                            showPlayerControls()
                         end
                         return true
                     end
                     return false
                 end
             }))
-            
-            controlsDialog.show()
-            startSeekBarUpdate()
+            moreDialog.show()
         end
     }))
 end
 
--- 9. Optimized SeekBar & Text Sync Thread
-local isUpdating = false
+-- 10. SeekBar Threaded Engine Loops
 startSeekBarUpdate = function()
-    if isUpdating then return end
-    isUpdating = true
-    local handler = Handler(Looper.getMainLooper())
-    local updateRunnable
-    local cycleCount = 0
-    updateRunnable = Runnable({
+    local seekHandler = Handler(Looper.getMainLooper())
+    local seekRunnable
+    seekRunnable = Runnable({
         run = function()
-            if controlsDialog and controlsDialog.isShowing() and player then
-                local isPlaying = false
-                local current = 0
-                local total = 0
-                
-                local ok = pcall(function()
-                    isPlaying = player.isPlaying()
-                    current = player.getCurrentPosition()
-                    total = player.getDuration()
-                end)
-
-                if ok and total > 0 then
-                    if btnPlayPauseRef then
-                        local expectedText = isPlaying and "Pause" or "Play"
-                        if tostring(btnPlayPauseRef.getText()) ~= expectedText then
-                            btnPlayPauseRef.setText(expectedText)
-                        end
+            pcall(function()
+                if player and _G.smart_player_is_prepared and controlsDialog and controlsDialog.isShowing() then
+                    local current = player.getCurrentPosition()
+                    local total = player.getDuration()
+                    if total > 0 then
+                        seekBarRef.setMax(total)
+                        seekBarRef.setProgress(current)
+                        
+                        local curSec = math.floor(current / 1000)
+                        local curMin = math.floor(curSec / 60)
+                        curSec = curSec % 60
+                        
+                        local totSec = math.floor(total / 1000)
+                        local totMin = math.floor(totSec / 60)
+                        totSec = totSec % 60
+                        
+                        txtTimeRef.setText(string.format("%02d:%02d / %02d:%02d", curMin, curSec, totMin, totSec))
                     end
-                    seekBarRef.setMax(total)
-                    seekBarRef.setProgress(current)
-                    
-                    if isPlaying then
-                        lastPlayedPosition = current
-                    end
-                    
-                    local curSec = math.floor(current / 1000)
-                    local curMin = math.floor(curSec / 60)
-                    curSec = curSec % 60
-                    
-                    local totSec = math.floor(total / 1000)
-                    local totMin = math.floor(totSec / 60)
-                    totSec = totSec % 60
-                    
-                    txtTimeRef.setText(string.format("%02d:%02d / %02d:%02d", curMin, curSec, totMin, totSec))
-                    cycleCount = cycleCount + 1
-                    if cycleCount >= 5 then cycleCount = 0 saveState() end
-                else
-                    if btnPlayPauseRef then
-                        local expectedText = isPlaying and "Pause" or "Play"
-                        if tostring(btnPlayPauseRef.getText()) ~= expectedText then
-                            btnPlayPauseRef.setText(expectedText)
-                        end
-                    end
-                    txtTimeRef.setText("00:00 / 00:00")
                 end
-                handler.postDelayed(updateRunnable, 1000)
-            else isUpdating = false end
+            end)
+            if player and _G.smart_player_is_prepared and controlsDialog and controlsDialog.isShowing() then
+                seekHandler.postDelayed(seekRunnable, 1000)
+            end
         end
     })
-    handler.post(updateRunnable)
+    seekHandler.postDelayed(seekRunnable, 1000)
 end
 
--- 10. More Options Menu 
-showMoreOptions = function()
-    local file = File(currentFilePath)
-    local options = {"Delete", "Share", "Playback Speed", "Rename"}
-    if currentSavedMediaType == "statuses" then
-        table.insert(options, 1, "Save to Gallery")
-    end
-    local builder = AlertDialog.Builder(service)
-    builder.setItems(options, function(dialog, which)
-        local idx = which + 1
-        if currentSavedMediaType == "statuses" then
-            if idx == 1 then
-                saveStatusToGallery(currentFilePath)
-                return
-            else
-                idx = idx - 1
-            end
-        end
-        if idx == 1 then
-            if file.isDirectory() then showToast("Cannot delete folders here.") return end
-            local confirm = AlertDialog.Builder(service)
-            confirm.setTitle("Delete File?")
-            confirm.setMessage("Are you sure you want to permanently delete this file?")
-            confirm.setPositiveButton("Yes", function()
-                player.reset() cancelNotification()
-                _G.smart_player_is_prepared = false
-                _G.smart_player_current_path = ""
-                
-                Thread(Runnable({
-                    run = function()
-                        local isDeleted = file.delete()
-                        Handler(Looper.getMainLooper()).post(Runnable({
-                            run = function()
-                                if isDeleted then
-                                    showToast("File deleted successfully.")
-                                    currentFilePath = "" lastPlayedPosition = 0 saveState()
-                                    if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
-                                    renderMediaList(currentSavedFolder, currentSavedMediaType)
-                                else showToast("Failed to delete file.") end
-                            end
-                        }))
-                    end
-                })).start()
-            end)
-            confirm.setNegativeButton("Cancel", nil)
-            showDialogSafe(confirm, function() showMoreOptions() end)
-        elseif idx == 2 then
-            saveState()
-            local originalPackage = ""
-            pcall(function()
-                local root = service.getRootInActiveWindow()
-                if root then originalPackage = tostring(root.getPackageName()) end
-            end)
-            if originalPackage == "" or originalPackage == "android" or originalPackage == "com.android.intentresolver" then
-                originalPackage = "com.android.launcher3"
-            end
-            if dialog then dialog.dismiss() end
-            if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
-
-            pcall(function()
-                local context = service
-                setStrictModeAllowFileUri()
-                local shareUri = Uri.fromFile(file)
-                local intent = Intent(Intent.ACTION_SEND)
-                intent.setType("*/*")
-                intent.putExtra(Intent.EXTRA_STREAM, shareUri)
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                local chooser = Intent.createChooser(intent, "Share File")
-                chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                context.startActivity(chooser)
-            end)
-
-            local monitorHandler = Handler(Looper.getMainLooper())
-            local monitorRunnable
-            local loopCount = 0
-            local hasLeftApp = false
-            
-            monitorRunnable = Runnable({
-                run = function()
-                    loopCount = loopCount + 1
-                    local currentPkg = ""
-                    pcall(function()
-                        local root = service.getRootInActiveWindow()
-                        if root then currentPkg = tostring(root.getPackageName()) end
-                    end)
-                    local currentPkgLower = currentPkg:lower()
-                    
-                    if currentPkg ~= "" and currentPkg ~= originalPackage and not currentPkgLower:find("launcher") and not currentPkgLower:find("home") then
-                        hasLeftApp = true
-                    end
-                    
-                    if hasLeftApp and (currentPkg == originalPackage or currentPkgLower:find("launcher") or currentPkgLower:find("home")) then
-                        Handler(Looper.getMainLooper()).post(Runnable({
-                            run = function() 
-                                if currentFilePath and currentFilePath ~= "" then
-                                    showPlayerControls()
-                                else
-                                    renderMediaList(currentSavedFolder, currentSavedMediaType)
-                                end
-                            end
-                        }))
-                    elseif not hasLeftApp and loopCount > 10 then
-                        Handler(Looper.getMainLooper()).post(Runnable({
-                            run = function()
-                                if currentFilePath and currentFilePath ~= "" then
-                                    showPlayerControls()
-                                else
-                                    renderMediaList(currentSavedFolder, currentSavedMediaType)
-                                end
-                            end
-                        }))
-                    elseif loopCount < 120 then
-                        monitorHandler.postDelayed(monitorRunnable, 1000)
-                    end
-                end
-            })
-            monitorHandler.postDelayed(monitorRunnable, 1000)
-        elseif idx == 3 then
-            showPlaybackSpeedMenu("player")
-        elseif idx == 4 then
-            Handler(Looper.getMainLooper()).post(Runnable({
-                run = function()
-                    local inputField = EditText(service)
-                    inputField.setText(file.getName())
-                    local renameDialog = AlertDialog.Builder(service)
-                    renameDialog.setTitle("Rename File")
-                    renameDialog.setView(inputField)
-                    renameDialog.setPositiveButton("Rename", function()
-                        local newName = tostring(inputField.getText())
-                        if newName ~= "" then
-                            local parent = file.getParentFile()
-                            local newFile = File(parent, newName)
-                            if file.renameTo(newFile) then
-                                showToast("Renamed successfully.")
-                                currentFilePath = newFile.getAbsolutePath()
-                                saveState()
-                                showPlayerControls()
-                            else
-                                showToast("Failed to rename.")
-                                showPlayerControls()
-                            end
-                        end
-                    end)
-                    renameDialog.setNegativeButton("Cancel", function() showPlayerControls() end)
-                    showDialogSafe(renameDialog, function() showPlayerControls() end)
-                end
-            }))
-        end
-    end)
-    builder.setNegativeButton("Cancel", function() showPlayerControls() end)
-    showDialogSafe(builder, function() showPlayerControls() end)
-end
-
--- Initialize Engine Initialization State Loops
+-- --- RUNTIME INITIALIZATION MATRIX ---
 loadState()
-showMainMenu()
+loadFavorites()
+
+if currentFilePath and currentFilePath ~= "" and _G.smart_player_is_prepared then
+    if _G.smart_player_minimized then
+        _G.smart_player_minimized = false
+        saveState()
+    end
+    showPlayerControls()
+else
+    showMainMenu()
+end
