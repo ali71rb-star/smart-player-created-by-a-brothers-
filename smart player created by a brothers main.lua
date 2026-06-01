@@ -333,6 +333,8 @@ end
 -- Persistent Storage: Save State
 local function saveState()
     pcall(function()
+        _G.smart_player_playlist = currentPlaylist
+        _G.smart_player_index = currentIndex
         local f = io.open(configPath, "w")
         if f then
             f:write((currentSavedFolder or "/storage/emulated/0") .. "\n")
@@ -365,6 +367,12 @@ end
 -- Persistent Storage: Load State
 local function loadState()
     pcall(function()
+        if _G.smart_player_playlist then
+            currentPlaylist = _G.smart_player_playlist
+        end
+        if _G.smart_player_index then
+            currentIndex = _G.smart_player_index
+        end
         local f = io.open(configPath, "r")
         if f then
             currentSavedFolder = f:read("*l") or "/storage/emulated/0"
@@ -695,6 +703,62 @@ local function saveStatusToGallery(filePath)
     end)
 end
 
+-- Local helper to build playlist dynamically when restoring or playing
+local function rebuildPlaylistFromFolder(folderPath, mediaType)
+    if not folderPath or folderPath == "" then return end
+    local file = File(folderPath)
+    local list = file.listFiles()
+    local rawItems = {}
+    if list and #list > 0 then
+        for i = 0, #list - 1 do
+            local f = list[i]
+            local name = f.getName()
+            if (mediaType == "statuses" or not name:find("^%.")) and not f.isDirectory() then
+                if matchesFormat(name, mediaType) then
+                    local time = 0
+                    pcall(function() time = f.lastModified() end)
+                    table.insert(rawItems, {name = name, path = f.getAbsolutePath(), isDir = false, time = time})
+                end
+            end
+        end
+    else
+        local dirs, files = getMediaStoreDirsAndFiles(folderPath, mediaType)
+        for _, f in ipairs(files) do
+            local time = 0
+            pcall(function() time = File(f.path).lastModified() end)
+            table.insert(rawItems, {name = f.name, path = f.path, isDir = false, time = time})
+        end
+    end
+
+    if currentSortMethod == "A-Z" then
+        table.sort(rawItems, function(a, b) return a.name:lower() < b.name:lower() end)
+    elseif currentSortMethod == "Z-A" then
+        table.sort(rawItems, function(a, b) return a.name:lower() > b.name:lower() end)
+    elseif currentSortMethod == "Newest" then
+        table.sort(rawItems, function(a, b) return (a.time or 0) > (b.time or 0) end)
+    elseif currentSortMethod == "Oldest" then
+        table.sort(rawItems, function(a, b) return (a.time or 0) < (b.time or 0) end)
+    end
+
+    currentPlaylist = {}
+    for _, item in ipairs(rawItems) do
+        if mediaType == "statuses" then
+            if item.path:lower():find("%.mp4$") then
+                table.insert(currentPlaylist, item.path)
+            end
+        else
+            table.insert(currentPlaylist, item.path)
+        end
+    end
+
+    for i, path in ipairs(currentPlaylist) do
+        if path == currentFilePath then
+            currentIndex = i
+            break
+        end
+    end
+end
+
 local showMainMenu, showStorageMenu, showWhatsAppMenu, showMediaTypeMenu, showBrowseModeMenu, renderMediaList, playMedia, showPlayerControls, showMoreOptions, startSeekBarUpdate, showSettingsMenu, showAudioSettingsMenu, showSleepTimerDialog, showPlaybackSpeedMenu, showStatusSettingsMenu, resumeLastPlayerState
 
 -- 1. Main Menu
@@ -776,6 +840,7 @@ showSettingsMenu = function()
         displayItems.add("Status Settings")
         displayItems.add("Show WhatsApp Media in Main Menu: " .. showWhatsAppMediaToggle:upper())
         displayItems.add("Multi-Select Mode: " .. multiSelectSetting:upper())
+        displayItems.add("About Extension")
         adapter.notifyDataSetChanged()
     end
     updateItems()
@@ -805,6 +870,43 @@ showSettingsMenu = function()
                 showToast("Multi-Select Mode: " .. multiSelectSetting:upper())
                 updateItems()
                 pcall(function() lv.setSelection(position) end)
+            elseif position == 4 then
+                dialog.dismiss()
+                Handler(Looper.getMainLooper()).post(Runnable({
+                    run = function()
+                        local aboutBuilder = AlertDialog.Builder(service)
+                        aboutBuilder.setTitle("About Extension")
+                        aboutBuilder.setMessage("Smart Player\nCreated by a brothers\n\nOverview:\nA professional high-performance media utility built for advanced persistence control, recursive background scanning, dynamic multi-speed playback modification, and comprehensive automated accessibility assistance.")
+                        aboutBuilder.setNegativeButton("Cancel", function() showSettingsMenu() end)
+                        aboutBuilder.setPositiveButton("Help & Feedback", DialogInterface.OnClickListener({
+                            onClick = function(d, w)
+                                pcall(function()
+                                    d.dismiss()
+                                    local message = "Official Smart Player Support & Feedback:\n\nHello Team,\nI am currently utilizing your Smart Player extension. I am incredibly impressed by its high-performance playback capabilities, robust design, and accessibility integration. Kindly keep me updated regarding future professional releases and technical builds."
+                                    local encodedMsg = Uri.encode(message)
+                                    local url = "https://api.whatsapp.com/send?phone=923477583735&text=" .. encodedMsg
+                                    local intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    service.startActivity(intent)
+                                end)
+                            end
+                        }))
+                        local abDialog = aboutBuilder.create()
+                        abDialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+                        import "android.view.KeyEvent"
+                        abDialog.setOnKeyListener(DialogInterface.OnKeyListener({
+                            onKey = function(d, keyCode, event)
+                                if keyCode == KeyEvent.KEYCODE_BACK and event.getAction() == KeyEvent.ACTION_UP then
+                                    abDialog.dismiss()
+                                    showSettingsMenu()
+                                    return true
+                                end
+                                return false
+                            end
+                        }))
+                        abDialog.show()
+                    end
+                }))
             end
         end
     }))
@@ -1004,13 +1106,13 @@ showAudioSettingsMenu = function()
             elseif position == 5 then
                 showVolumeBoostToggle = (showVolumeBoostToggle == "on") and "off" or "on"
                 saveState()
-                showToast("Volume Boost visibility updated")
+                showToast("Volume Boost: " .. showVolumeBoostToggle:upper())
                 updateItems()
                 pcall(function() lv.setSelection(position) end)
             elseif position == 6 then
                 showSleepTimerToggle = (showSleepTimerToggle == "on") and "off" or "on"
                 saveState()
-                showToast("Sleep Timer visibility updated")
+                showToast("Sleep Timer: " .. showSleepTimerToggle:upper())
                 updateItems()
                 pcall(function() lv.setSelection(position) end)
             end
@@ -1344,8 +1446,13 @@ renderMediaList = function(currentPath, mediaType)
     end
 
     if #filteredList == 0 and currentSearchQuery == "" then
-        showToast("No files found.")
-        showMainMenu()
+        if currentBrowseMode == "favorites" then
+            showToast("Favorite Button Empty")
+            showBrowseModeMenu(currentPath, mediaType)
+        else
+            showToast("No files found.")
+            showMainMenu()
+        end
         return
     end
 
@@ -1938,6 +2045,11 @@ end
 
 -- 8. Custom Player Window
 showPlayerControls = function()
+    -- Dynamic Playlist Rebuild from saved folder state on wake up / resume
+    if #currentPlaylist == 0 and currentSavedFolder and currentSavedFolder ~= "" then
+        rebuildPlaylistFromFolder(currentSavedFolder, currentSavedMediaType)
+    end
+
     if controlsDialog and controlsDialog.isShowing() then
         if txtTitleRef then txtTitleRef.setText(File(currentFilePath).getName()) end
         if btnFavoriteRef then
@@ -2219,385 +2331,4 @@ showPlayerControls = function()
             btnExit.setText("Exit")
             btnExit.setOnClickListener(View.OnClickListener({
                 onClick = function(v)
-                    pcall(function() player.reset() end)
-                    currentFilePath = ""
-                    lastPlayedPosition = 0
-                    currentSavedFolder = "" 
-                    _G.smart_player_is_prepared = false
-                    _G.smart_player_current_path = ""
-                    _G.smart_player_minimized = false
-                    saveState()
-                    cancelNotification()
-                    if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
-                end
-            }))
-            layout.addView(btnExit)
-
-            scrollView.addView(layout)
-            local builder = AlertDialog.Builder(context)
-            builder.setView(scrollView)
-            controlsDialog = builder.create()
-            controlsDialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
-            
-            if currentSavedMediaType == "video" or currentSavedMediaType == "statuses" then
-                controlsDialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            end
-            
-            import "android.view.KeyEvent"
-            controlsDialog.setOnKeyListener(DialogInterface.OnKeyListener({
-                onKey = function(dialog, keyCode, event)
-                    if keyCode == KeyEvent.KEYCODE_BACK and event.getAction() == KeyEvent.ACTION_UP then
-                        controlsDialog.dismiss()
-                        controlsDialog = nil
-                        saveState()
-                        
-                        if currentSavedFolder and currentSavedFolder ~= "" then
-                            isMultiSelectActive = false
-                            selectedItemsMap = {}
-                            renderMediaList(currentSavedFolder, currentSavedMediaType)
-                        else
-                            _G.smart_player_minimized = true
-                            if backgroundPlay == "on" then
-                                showNotification(File(currentFilePath).getName())
-                            else
-                                pcall(function() 
-                                    if player.isPlaying() then player.pause() end 
-                                    lastPlayedPosition = player.getCurrentPosition() 
-                        end)
-                                _G.smart_player_is_prepared = true
-                                saveState() cancelNotification()
-                            end
-                        end
-                        return true
-                    end
-                    return false
-                end
-            }))
-            
-            controlsDialog.show()
-            startSeekBarUpdate()
-        end
-    }))
-end
-
--- 9. Optimized SeekBar & Text Sync Thread
-local isUpdating = false
-startSeekBarUpdate = function()
-    if isUpdating then return end
-    isUpdating = true
-    local handler = Handler(Looper.getMainLooper())
-    local updateRunnable
-    local cycleCount = 0
-    updateRunnable = Runnable({
-        run = function()
-            if controlsDialog and controlsDialog.isShowing() and player then
-                local isPlaying = false
-                local current = 0
-                local total = 0
-                
-                local ok = pcall(function()
-                    isPlaying = player.isPlaying()
-                    current = player.getCurrentPosition()
-                    total = player.getDuration()
-                end)
-
-                if ok and total > 0 then
-                    if btnPlayPauseRef then
-                        local expectedText = isPlaying and "Pause" or "Play"
-                        if tostring(btnPlayPauseRef.getText()) ~= expectedText then
-                            btnPlayPauseRef.setText(expectedText)
-                        end
-                    end
-                    seekBarRef.setMax(total)
-                    seekBarRef.setProgress(current)
-                    
-                    if isPlaying then
-                        lastPlayedPosition = current
-                    end
-                    
-                    local curSec = math.floor(current / 1000)
-                    local curMin = math.floor(curSec / 60)
-                    curSec = curSec % 60
-                    
-                    local totSec = math.floor(total / 1000)
-                    local totMin = math.floor(totSec / 60)
-                    totSec = totSec % 60
-                    
-                    txtTimeRef.setText(string.format("%02d:%02d / %02d:%02d", curMin, curSec, totMin, totSec))
-                    cycleCount = cycleCount + 1
-                    if cycleCount >= 5 then cycleCount = 0 saveState() end
-                else
-                    if btnPlayPauseRef then
-                        local expectedText = isPlaying and "Pause" or "Play"
-                        if tostring(btnPlayPauseRef.getText()) ~= expectedText then
-                            btnPlayPauseRef.setText(expectedText)
-                        end
-                    end
-                    txtTimeRef.setText("00:00 / 00:00")
-                end
-                handler.postDelayed(updateRunnable, 1000)
-            else isUpdating = false end
-        end
-    })
-    handler.post(updateRunnable)
-end
-
--- 10. More Options Menu
-showMoreOptions = function()
-    local file = File(currentFilePath)
-    local options = {"Delete", "Share", "Playback Speed", "Rename"}
-    if currentSavedMediaType == "statuses" then
-        table.insert(options, 1, "Save to Gallery")
-    end
-    local builder = AlertDialog.Builder(service)
-    builder.setItems(options, function(dialog, which)
-        local idx = which + 1
-        if currentSavedMediaType == "statuses" then
-            if idx == 1 then
-                saveStatusToGallery(currentFilePath)
-                return
-            else
-                idx = idx - 1
-            end
-        end
-        if idx == 1 then
-            if file.isDirectory() then showToast("Cannot delete folders here.") return end
-            local confirm = AlertDialog.Builder(service)
-            confirm.setTitle("Delete File?")
-            confirm.setMessage("Are you sure you want to permanently delete this file?")
-            confirm.setPositiveButton("Yes", function()
-                player.reset() cancelNotification()
-                _G.smart_player_is_prepared = false
-                _G.smart_player_current_path = ""
-                
-                Thread(Runnable({
-                    run = function()
-                        local isDeleted = file.delete()
-                        Handler(Looper.getMainLooper()).post(Runnable({
-                            run = function()
-                                if isDeleted then
-                                    showToast("File deleted successfully.")
-                                    currentFilePath = "" lastPlayedPosition = 0 saveState()
-                                    if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
-                                    renderMediaList(currentSavedFolder, currentSavedMediaType)
-                                else showToast("Failed to delete file.") end
-                            end
-                        }))
-                    end
-                })).start()
-            end)
-            confirm.setNegativeButton("Cancel", nil)
-            showDialogSafe(confirm, function() showMoreOptions() end)
-        elseif idx == 2 then
-            saveState()
-            local originalPackage = ""
-            pcall(function()
-                local root = service.getRootInActiveWindow()
-                if root then originalPackage = tostring(root.getPackageName()) end
-            end)
-            if originalPackage == "" or originalPackage == "android" or originalPackage == "com.android.intentresolver" then
-                originalPackage = "com.android.launcher3"
-            end
-            if dialog then dialog.dismiss() end
-            if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
-
-            pcall(function()
-                local context = service
-                setStrictModeAllowFileUri()
-                local shareUri = Uri.fromFile(file)
-                local intent = Intent(Intent.ACTION_SEND)
-                intent.setType("*/*")
-                intent.putExtra(Intent.EXTRA_STREAM, shareUri)
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                local chooser = Intent.createChooser(intent, "Share File")
-                chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                context.startActivity(chooser)
-            end)
-
-            local monitorHandler = Handler(Looper.getMainLooper())
-            local monitorRunnable
-            local loopCount = 0
-            local hasLeftApp = false
-            
-            monitorRunnable = Runnable({
-                run = function()
-                    loopCount = loopCount + 1
-                    local currentPkg = ""
-                    pcall(function()
-                        local root = service.getRootInActiveWindow()
-                        if root then currentPkg = tostring(root.getPackageName()) end
-                    end)
-                    local currentPkgLower = currentPkg:lower()
-                    
-                    if currentPkg ~= "" and currentPkg ~= originalPackage and not currentPkgLower:find("launcher") and not currentPkgLower:find("home") then
-                        hasLeftApp = true
-                    end
-                    
-                    if hasLeftApp and (currentPkg == originalPackage or currentPkgLower:find("launcher") or currentPkgLower:find("home")) then
-                        Handler(Looper.getMainLooper()).post(Runnable({
-                            run = function() 
-                                if currentFilePath and currentFilePath ~= "" then
-                                    showPlayerControls()
-                                else
-                                    renderMediaList(currentSavedFolder, currentSavedMediaType)
-                                end
-                            end
-                        }))
-                    elseif not hasLeftApp and loopCount > 10 then
-                        Handler(Looper.getMainLooper()).post(Runnable({
-                            run = function()
-                                if currentFilePath and currentFilePath ~= "" then
-                                    showPlayerControls()
-                                else
-                                    renderMediaList(currentSavedFolder, currentSavedMediaType)
-                                end
-                            end
-                        }))
-                    elseif loopCount < 120 then
-                        monitorHandler.postDelayed(monitorRunnable, 1000)
-                    end
-                end
-            })
-            monitorHandler.postDelayed(monitorRunnable, 1000)
-        elseif idx == 3 then
-            showPlaybackSpeedMenu("player")
-        elseif idx == 4 then
-            Handler(Looper.getMainLooper()).post(Runnable({
-                run = function()
-                    local fullName = file.getName()
-                    local baseName = fullName
-                    local ext = ""
-                    local dotPos = fullName:match("^.*()%.%w+$")
-                    if dotPos then
-                        baseName = fullName:sub(1, dotPos - 1)
-                        ext = fullName:sub(dotPos)
-                    end
-                    
-                    local inputField = EditText(service)
-                    inputField.setText(baseName)
-                    local renameDialog = AlertDialog.Builder(service)
-                    renameDialog.setTitle("Rename File")
-                    renameDialog.setView(inputField)
-                    renameDialog.setPositiveButton("Rename", function()
-                        local newBaseName = tostring(inputField.getText())
-                        if newBaseName ~= "" then
-                            local newName = newBaseName .. ext
-                            local parent = file.getParentFile()
-                            local newFile = File(parent, newName)
-                            if file.renameTo(newFile) then
-                                showToast("Renamed successfully.")
-                                currentFilePath = newFile.getAbsolutePath()
-                                saveState()
-                                showPlayerControls()
-                            else
-                                showToast("Failed to rename.")
-                                showPlayerControls()
-                            end
-                        end
-                    end)
-                    renameDialog.setNegativeButton("Cancel", function() showPlayerControls() end)
-                    showDialogSafe(renameDialog, function() showPlayerControls() end)
-                end
-            }))
-        end
-    end)
-    builder.setNegativeButton("Cancel", function() showPlayerControls() end)
-    showDialogSafe(builder, function() showPlayerControls() end)
-end
-
--- 11. Core Engine Startup Restorer (Resumes seamlessly from minimization/exit state)
-resumeLastPlayerState = function()
-    if currentFilePath and currentFilePath ~= "" and File(currentFilePath).exists() then
-        local folderPath = currentSavedFolder or File(currentFilePath).getParent()
-        local mediaType = currentSavedMediaType or "audio"
-        local rawItems = {}
-        
-        -- Dynamically rebuild list based on original browse mode to keep exact alignment
-        if currentBrowseMode == "all_files" then
-            rawItems = getAllRecursiveFiles(folderPath, mediaType)
-        elseif currentBrowseMode == "favorites" then
-            rawItems = {}
-            for path, _ in pairs(favoritesMap) do
-                if path:sub(1, #folderPath) == folderPath then
-                    local f = File(path)
-                    if f.exists() then
-                        local name = f.getName()
-                        if matchesFormat(name, mediaType) then
-                            local time = 0
-                            pcall(function() time = f.lastModified() end)
-                            table.insert(rawItems, {name = name, path = path, isDir = false, time = time})
-                        end
-                    end
-                end
-            end
-        else
-            local file = File(folderPath)
-            local list = nil
-            pcall(function() list = file.listFiles() end)
-            local isStorageRoot = (folderPath == "/storage")
-
-            if list and #list > 0 then
-                for i = 0, #list - 1 do
-                    local f = list[i]
-                    local name = f.getName()
-                    if (mediaType == "statuses" or not name:find("^%.")) and name ~= "emulated" and name ~= "self" and name ~= "sdcard0" and name ~= "0" then
-                        if not (isStorageRoot and name:find("^%w+-%w+$")) then
-                            local isDir = false
-                            pcall(function() isDir = f.isDirectory() end)
-                            local time = 0
-                            pcall(function() time = f.lastModified() end)
-                            if not isDir and matchesFormat(name, mediaType) then
-                                table.insert(rawItems, {name = name, path = f.getAbsolutePath(), isDir = false, time = time})
-                            end
-                        end
-                    end
-                end
-            else
-                local dirs, files = getMediaStoreDirsAndFiles(folderPath, mediaType)
-                for _, f in ipairs(files) do
-                    local time = 0
-                    pcall(function() time = File(f.path).lastModified() end)
-                    table.insert(rawItems, {name = f.name, path = f.path, isDir = false, time = time})
-                end
-            end
-        end
-
-        if currentSortMethod == "A-Z" then
-            table.sort(rawItems, function(a, b) return a.name:lower() < b.name:lower() end)
-        elseif currentSortMethod == "Z-A" then
-            table.sort(rawItems, function(a, b) return a.name:lower() > b.name:lower() end)
-        elseif currentSortMethod == "Newest" then
-            table.sort(rawItems, function(a, b) return (a.time or 0) > (b.time or 0) end)
-        elseif currentSortMethod == "Oldest" then
-            table.sort(rawItems, function(a, b) return (a.time or 0) < (b.time or 0) end)
-        end
-        
-        currentPlaylist = {}
-        for _, innerObj in ipairs(rawItems) do
-            if mediaType == "statuses" then
-                if innerObj.path:lower():find("%.mp4$") then
-                    table.insert(currentPlaylist, innerObj.path)
-                end
-            else
-                table.insert(currentPlaylist, innerObj.path)
-            end
-        end
-        for i, path in ipairs(currentPlaylist) do
-            if path == currentFilePath then
-                currentIndex = i
-                break
-            end
-        end
-        _G.smart_player_is_prepared = true
-        _G.smart_player_current_path = currentFilePath
-        showPlayerControls()
-    else
-        showMainMenu()
-    end
-end
-
--- Initialize Engine
-loadState()
-loadFavorites()
-resumeLastPlayerState()
+                    pcall(function() player.reset()
