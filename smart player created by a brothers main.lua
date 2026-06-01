@@ -2331,4 +2331,299 @@ showPlayerControls = function()
             btnExit.setText("Exit")
             btnExit.setOnClickListener(View.OnClickListener({
                 onClick = function(v)
-                    pcall(function() player.reset()
+                    pcall(function() player.reset() end)
+                    currentFilePath = ""
+                    lastPlayedPosition = 0
+                    currentSavedFolder = "" 
+                    _G.smart_player_is_prepared = false
+                    _G.smart_player_current_path = ""
+                    _G.smart_player_minimized = false
+                    saveState()
+                    cancelNotification()
+                    if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
+                end
+            }))
+            layout.addView(btnExit)
+
+            scrollView.addView(layout)
+            local builder = AlertDialog.Builder(context)
+            builder.setView(scrollView)
+            controlsDialog = builder.create()
+            controlsDialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+            
+            if currentSavedMediaType == "video" or currentSavedMediaType == "statuses" then
+                controlsDialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            end
+            
+            import "android.view.KeyEvent"
+            controlsDialog.setOnKeyListener(DialogInterface.OnKeyListener({
+                onKey = function(dialog, keyCode, event)
+                    if keyCode == KeyEvent.KEYCODE_BACK and event.getAction() == KeyEvent.ACTION_UP then
+                        controlsDialog.dismiss()
+                        controlsDialog = nil
+                        saveState()
+                        
+                        if currentSavedFolder and currentSavedFolder ~= "" then
+                            isMultiSelectActive = false
+                            selectedItemsMap = {}
+                            renderMediaList(currentSavedFolder, currentSavedMediaType)
+                        else
+                            _G.smart_player_minimized = true
+                            if backgroundPlay == "on" then
+                                showNotification(File(currentFilePath).getName())
+                            else
+                                pcall(function() 
+                                    if player.isPlaying() then player.pause() end 
+                                    lastPlayedPosition = player.getCurrentPosition() 
+                        end)
+                                _G.smart_player_is_prepared = true
+                                saveState() cancelNotification()
+                            end
+                        end
+                        return true
+                    end
+                    return false
+                end
+            }))
+            
+            controlsDialog.show()
+            startSeekBarUpdate()
+        end
+    }))
+end
+
+-- 9. Optimized SeekBar & Text Sync Thread
+local isUpdating = false
+startSeekBarUpdate = function()
+    if isUpdating then return end
+    isUpdating = true
+    local handler = Handler(Looper.getMainLooper())
+    local updateRunnable
+    local cycleCount = 0
+    updateRunnable = Runnable({
+        run = function()
+            if controlsDialog and controlsDialog.isShowing() and player then
+                local isPlaying = false
+                local current = 0
+                local total = 0
+                
+                local ok = pcall(function()
+                    isPlaying = player.isPlaying()
+                    current = player.getCurrentPosition()
+                    total = player.getDuration()
+                end)
+
+                if ok and total > 0 then
+                    if btnPlayPauseRef then
+                        local expectedText = isPlaying and "Pause" or "Play"
+                        if tostring(btnPlayPauseRef.getText()) ~= expectedText then
+                            btnPlayPauseRef.setText(expectedText)
+                        end
+                    end
+                    seekBarRef.setMax(total)
+                    seekBarRef.setProgress(current)
+                    
+                    if isPlaying then
+                        lastPlayedPosition = current
+                    end
+                    
+                    local curSec = math.floor(current / 1000)
+                    local curMin = math.floor(curSec / 60)
+                    curSec = curSec % 60
+                    
+                    local totSec = math.floor(total / 1000)
+                    local totMin = math.floor(totSec / 60)
+                    totSec = totSec % 60
+                    
+                    txtTimeRef.setText(string.format("%02d:%02d / %02d:%02d", curMin, curSec, totMin, totSec))
+                    cycleCount = cycleCount + 1
+                    if cycleCount >= 5 then cycleCount = 0 saveState() end
+                else
+                    if btnPlayPauseRef then
+                        local expectedText = isPlaying and "Pause" or "Play"
+                        if tostring(btnPlayPauseRef.getText()) ~= expectedText then
+                            btnPlayPauseRef.setText(expectedText)
+                        end
+                    end
+                    txtTimeRef.setText("00:00 / 00:00")
+                end
+                handler.postDelayed(updateRunnable, 1000)
+            else isUpdating = false end
+        end
+    })
+    handler.post(updateRunnable)
+end
+
+-- 10. More Options Menu
+showMoreOptions = function()
+    local file = File(currentFilePath)
+    local options = {"Delete", "Share", "Playback Speed", "Rename"}
+    if currentSavedMediaType == "statuses" then
+        table.insert(options, 1, "Save to Gallery")
+    end
+    local builder = AlertDialog.Builder(service)
+    builder.setItems(options, function(dialog, which)
+        local idx = which + 1
+        local selectedOpt = options[idx]
+        
+        if selectedOpt == "Save to Gallery" then
+            saveStatusToGallery(currentFilePath)
+        elseif selectedOpt == "Delete" then
+            local confDel = AlertDialog.Builder(service)
+            confDel.setTitle("Delete File?")
+            confDel.setMessage("Are you sure you want to permanently delete this file?")
+            confDel.setPositiveButton("Delete", function()
+                local f = File(currentFilePath)
+                if f.delete() then
+                    showToast("Deleted successfully.")
+                    player.reset()
+                    cancelNotification()
+                    _G.smart_player_is_prepared = false
+                    _G.smart_player_current_path = ""
+                    currentFilePath = ""
+                    lastPlayedPosition = 0
+                    saveState()
+                    if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
+                    renderMediaList(currentSavedFolder, currentSavedMediaType)
+                else
+                    showToast("Failed to delete.")
+                end
+            end)
+            confDel.setNegativeButton("Cancel", nil)
+            showDialogSafe(confDel)
+        elseif selectedOpt == "Share" then
+            if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
+            
+            local originalPackage = ""
+            pcall(function()
+                local root = service.getRootInActiveWindow()
+                if root then originalPackage = tostring(root.getPackageName()) end
+            end)
+            if originalPackage == "" or originalPackage == "android" or originalPackage == "com.android.intentresolver" then
+                originalPackage = "com.android.launcher3"
+            end
+            
+            pcall(function()
+                local context = service
+                setStrictModeAllowFileUri()
+                local shareUri = Uri.fromFile(File(currentFilePath))
+                local intent = Intent(Intent.ACTION_SEND)
+                intent.setType("*/*")
+                intent.putExtra(Intent.EXTRA_STREAM, shareUri)
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                local chooser = Intent.createChooser(intent, "Share File")
+                chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(chooser)
+            end)
+            
+            local monitorHandler = Handler(Looper.getMainLooper())
+            local monitorRunnable
+            local loopCount = 0
+            local hasLeftApp = false
+            
+            monitorRunnable = Runnable({
+                run = function()
+                    loopCount = loopCount + 1
+                    local currentPkg = ""
+                    pcall(function()
+                        local root = service.getRootInActiveWindow()
+                        if root then currentPkg = tostring(root.getPackageName()) end
+                    end)
+                    local currentPkgLower = currentPkg:lower()
+                    
+                    if currentPkg ~= "" and currentPkg ~= originalPackage and not currentPkgLower:find("launcher") and not currentPkgLower:find("home") then
+                        hasLeftApp = true
+                    end
+                    
+                    if hasLeftApp and (currentPkg == originalPackage or currentPkgLower:find("launcher") or currentPkgLower:find("home")) then
+                        Handler(Looper.getMainLooper()).post(Runnable({
+                            run = function() 
+                                showPlayerControls()
+                            end
+                        }))
+                    elseif not hasLeftApp and loopCount > 10 then
+                        Handler(Looper.getMainLooper()).post(Runnable({
+                            run = function()
+                                showPlayerControls()
+                            end
+                        }))
+                    elseif loopCount < 120 then
+                        monitorHandler.postDelayed(monitorRunnable, 1000)
+                    end
+                end
+            })
+            monitorHandler.postDelayed(monitorRunnable, 1000)
+            
+        elseif selectedOpt == "Playback Speed" then
+            showPlaybackSpeedMenu("player")
+        elseif selectedOpt == "Rename" then
+            Handler(Looper.getMainLooper()).post(Runnable({
+                run = function()
+                    local f = File(currentFilePath)
+                    local oldFullName = f.getName()
+                    
+                    -- Extract filename and extension accurately
+                    local displayName = oldFullName
+                    local extension = ""
+                    local dotIndex = oldFullName:match("^.*()%.")
+                    if dotIndex then
+                        displayName = oldFullName:sub(1, dotIndex - 1)
+                        extension = oldFullName:sub(dotIndex) -- includes the dot
+                    end
+                    
+                    local inputField = EditText(service)
+                    inputField.setText(displayName) -- Show clean name without extension
+                    inputField.setSelectAllOnFocus(true)
+                    inputField.setOnClickListener(View.OnClickListener({
+                        onClick = function(v)
+                            inputField.setText("")
+                        end
+                    }))
+                    
+                    local renBuilder = AlertDialog.Builder(service)
+                    renBuilder.setTitle("Rename File")
+                    renBuilder.setView(inputField)
+                    renBuilder.setPositiveButton("Rename", function()
+                        local userInput = tostring(inputField.getText())
+                        if userInput ~= "" and userInput ~= displayName then
+                            -- Automatically attach the cached hidden extension
+                            local newFullName = userInput .. extension
+                            local parent = f.getParentFile()
+                            local newFile = File(parent, newFullName)
+                            if f.renameTo(newFile) then
+                                showToast("Renamed successfully.")
+                                currentFilePath = newFile.getAbsolutePath()
+                                _G.smart_player_current_path = currentFilePath
+                                saveState()
+                                
+                                -- Refresh the dynamic playlist in memory to reflect new file name
+                                if currentSavedFolder and currentSavedFolder ~= "" then
+                                    rebuildPlaylistFromFolder(currentSavedFolder, currentSavedMediaType)
+                                end
+                                
+                                if txtTitleRef then txtTitleRef.setText(newFullName) end
+                            else
+                                showToast("Rename failed.")
+                            end
+                        end
+                    end)
+                    renBuilder.setNegativeButton("Cancel", nil)
+                    showDialogSafe(renBuilder)
+                end
+            }))
+        end
+    end)
+    builder.setNegativeButton("Cancel", nil)
+    showDialogSafe(builder)
+end
+
+-- Initialization Engine Execution
+loadState()
+loadFavorites()
+
+if currentFilePath and currentFilePath ~= "" and _G.smart_player_is_prepared and _G.smart_player_minimized then
+    showPlayerControls()
+else
+    showMainMenu()
+end
