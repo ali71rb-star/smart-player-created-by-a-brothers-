@@ -1399,15 +1399,19 @@ renderMediaList = function(currentPath, mediaType)
             local dirs, files = getMediaStoreDirsAndFiles(currentPath, mediaType)
             for _, d in ipairs(dirs) do
                 if d.name ~= "emulated" and d.name ~= "self" and d.name ~= "sdcard0" and d.name ~= "0" then
-                    local time = 0
-                    pcall(function() time = File(d.path).lastModified() end)
-                    table.insert(rawItems, {name = d.name, path = d.path, isDir = true, time = time})
+                    if File(d.path).exists() then
+                        local time = 0
+                        pcall(function() time = File(d.path).lastModified() end)
+                        table.insert(rawItems, {name = d.name, path = d.path, isDir = true, time = time})
+                    end
                 end
             end
             for _, f in ipairs(files) do
-                local time = 0
-                pcall(function() time = File(f.path).lastModified() end)
-                table.insert(rawItems, {name = f.name, path = f.path, isDir = false, time = time})
+                if File(f.path).exists() then
+                    local time = 0
+                    pcall(function() time = File(f.path).lastModified() end)
+                    table.insert(rawItems, {name = f.name, path = f.path, isDir = false, time = time})
+                end
             end
         end
     end
@@ -1451,7 +1455,11 @@ renderMediaList = function(currentPath, mediaType)
             showBrowseModeMenu(currentPath, mediaType)
         else
             showToast("No files found.")
-            showMainMenu()
+            if tostring(currentPath):find("WhatsApp") then
+                showWhatsAppMenu()
+            else
+                showMainMenu()
+            end
         end
         return
     end
